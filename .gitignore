@@ -1,0 +1,11 @@
+build/
+*.o
+*.d
+fsync-server
+test-client
+storage/
+*.part.*
+.vscode/
+.idea/
+*.swp
+.DS_Store

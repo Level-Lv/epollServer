@@ -12,7 +12,7 @@
 ## 0. 本文档读法
 
 - PRD 是需求与验收契约；本文档是"把 PRD 落成可实现的架构"：模块划分、数据结构、线程/所有权规则、锁序、关键流程伪代码、错误映射。
-- 与 PRD 冲突时以 PRD 为准。本文档做出的所有**推断性决策**集中在 §15，**PRD 附录 A 的 2 处字节数勘误**也在 §15，请重点审阅这两部分。
+- 与 PRD 冲突时以 PRD 为准。本文档做出的所有**推断性决策**集中在 §15，**PRD 附录 A 的 3 处勘误（E1–E3）**也在 §15，请重点审阅这两部分。
 - 协议格式、验收标准、CLI 参数等不在此重复，只引用 PRD 章节号。
 
 ## 1. 范围
@@ -225,12 +225,13 @@ void ThreadPool::worker_loop() {
 
 ```
 events = EPOLLRDHUP
-       | (EPOLLIN  当 !closing && !paused_in)
+       | (EPOLLIN  当 !closing && !paused_in && !peer_eof)
        | (EPOLLOUT 当 out_buf 非空)
 ```
 
 - `paused_in`：高水位（out_buf ≥ 8 MiB）置位 → 摘 EPOLLIN；发送冲刷至 ≤ 4 MiB 清零 → 复挂。LT 下暂停期间到达的数据留在内核缓冲，复挂后按层触发补通知，无丢失风险（这正是选 LT 的理由之一）。
 - `closing`：任何关闭路径一旦进入"冲刷中"，不再读新数据（摘 EPOLLIN），但保留 EPOLLOUT 直到 out_buf 清空。
+- `peer_eof`：收到 RDHUP / 读到 0 后置位 → 摘 EPOLLIN（"停止读"，PRD §8.4），由 §6.2 的 RDHUP 分支即时 `update_interest` 落地；LT 下不再对残留数据重复报 EPOLLIN。
 - 与已注册掩码相同则跳过 `epoll_ctl`（`conn->epoll_events` 记录当前掩码）。
 
 ### 6.2 事件循环骨架
@@ -250,6 +251,7 @@ while (running_) {
         if (ev.events & (EPOLLERR | EPOLLHUP)) { disconnect(c, /*immediate=*/true); continue; }
         if (ev.events & EPOLLRDHUP) {                     // 半关：不再读，见下
             c->peer_eof = true;
+            update_interest(c);                           // 摘掉 EPOLLIN（§6.1）
             if (out_empty(c)) { finalize(c); continue; }
         }
         if (ev.events & EPOLLOUT) {                       // 冲刷 out_buf
@@ -265,6 +267,7 @@ while (running_) {
 
 - **陈旧事件安全**：任何一批 `epoll_wait` 结果中，每 fd 至多一条事件。IO 在某条事件里 `finalize`（DEL + close）后，同批不会再有该 fd 的事件；其它事件按 fd 查表，查不到或 `closed` 即跳过。accept 复用的新 fd 不会命中同批旧事件（批次是快照）。这是"只在 IO 线程 close fd"之所以充分安全的关键。
 - `read_parse()` 可能因 `submit()` 阻塞而停住整个 IO 线程——这是 PRD §8.2 的既定语义，接受。
+- `read_parse` 入口自查 `peer_eof`：为真直接返回（与 §6.1 摘 EPOLLIN 互为双保险，覆盖同批 EPOLLIN|EPOLLRDHUP 组合事件与摘除生效前的窗口）。
 
 ### 6.3 accept
 
@@ -600,6 +603,7 @@ make clean
 | D14  | `EMFILE` 时的 accept 策略：记 WARN、跳过本轮 accept（不终止进程）。                                                              |
 | E1   | **勘误**：PRD 附录 A 的 `FILE_META` 示例 body_len 应为 51（0x33），原文 0x29 有误。                                              |
 | E2   | **勘误**：PRD 附录 A 的 `ACK` 示例 body_len 应为 40（0x28），原文 0x24 有误。                                                    |
+| E3   | **勘误**：PRD 附录 A 帧头示例把 magic 写成 `4E 59 53 46`（小端字节序），按 §5.1“所有多字节整数大端”，线上字节应为 `46 53 59 4E`。以 §5.1 字段定义为准。 |
 
 ## 16. 实现顺序与风险
 
