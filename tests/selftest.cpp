@@ -1,13 +1,18 @@
-// tests/selftest.cpp — common.h + md5 自测
+// tests/selftest.cpp — common.h + md5 + log 自测
 // 编译运行：
-//   g++ -std=c++17 -Wall -Wextra -Wpedantic -O2 tests/selftest.cpp src/md5.cpp -o /tmp/selftest && /tmp/selftest
+//   g++ -std=c++17 -Wall -Wextra -Wpedantic -O2 tests/selftest.cpp src/md5.cpp src/log.cpp -o /tmp/selftest && /tmp/selftest
 #include "../src/common.h"
+#include "../src/log.h"
 #include "../src/md5.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
+
+#include <unistd.h>   // dup/dup2/close/STDERR_FILENO：捕获 stderr 用（目标平台 Linux）
 
 namespace {
 
@@ -190,6 +195,160 @@ void test_md5_reset_reuse() {
     expect_str(m.final_hex(), "900150983cd24fb0d6963f7d28e17f72", "md5 reset() then reuse");
 }
 
+// ---------- 日志 ----------
+
+// 把 stderr（fd 2）临时重定向到匿名临时文件；stop() 恢复 stderr 并取回捕获内容。
+// 仅测试主线程构造/析构；期间被测线程往 fd 2 写的日志全部进入捕获文件。
+class StderrCapture {
+public:
+    StderrCapture() {
+        file_ = std::tmpfile();
+        if (file_ == nullptr) return;             // 捕获失败：stop() 返回空串，断言自然 FAIL
+        saved_ = ::dup(STDERR_FILENO);
+        if (saved_ < 0 || ::dup2(::fileno(file_), STDERR_FILENO) < 0) {
+            if (saved_ >= 0) ::close(saved_);
+            std::fclose(file_);
+            file_ = nullptr;
+            saved_ = -1;
+        }
+    }
+    ~StderrCapture() { if (file_ != nullptr) stop(); }
+    StderrCapture(const StderrCapture&) = delete;
+    StderrCapture& operator=(const StderrCapture&) = delete;
+
+    std::string stop() {
+        std::string out;
+        if (file_ == nullptr) return out;
+        std::fflush(stderr);
+        if (saved_ >= 0) ::dup2(saved_, STDERR_FILENO);
+        std::rewind(file_);
+        char buf[4096];
+        std::size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, file_)) > 0) out.append(buf, n);
+        std::fclose(file_);
+        file_ = nullptr;
+        if (saved_ >= 0) { ::close(saved_); saved_ = -1; }
+        return out;
+    }
+
+private:
+    std::FILE* file_ = nullptr;
+    int saved_ = -1;
+};
+
+std::size_t count_substr(const std::string& hay, const char* needle) {
+    const std::size_t nlen = std::strlen(needle);
+    std::size_t cnt = 0;
+    for (std::size_t pos = hay.find(needle); pos != std::string::npos;
+         pos = hay.find(needle, pos + nlen)) {
+        ++cnt;
+    }
+    return cnt;
+}
+
+std::size_t count_lines(const std::string& s) {
+    std::size_t cnt = 0;
+    for (char c : s) {
+        if (c == '\n') ++cnt;
+    }
+    return cnt;
+}
+
+// 行首时间戳段形状："[YYYY-MM-DD HH:MM:SS.mmm]["（25 字符时间戳段 + 下一段开头）
+bool ts_shape_ok(const std::string& line) {
+    if (line.size() < 26) return false;
+    if (line[0] != '[' || line[5] != '-' || line[8] != '-' || line[11] != ' ' ||
+        line[14] != ':' || line[17] != ':' || line[20] != '.' ||
+        line[24] != ']' || line[25] != '[') {
+        return false;
+    }
+    static const int kDigits[] = {1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22, 23};
+    for (int i : kDigits) {
+        const char c = line[static_cast<std::size_t>(i)];
+        if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+
+// 返回形状不合法的行数（含"无换行结尾"的残尾行）
+std::size_t bad_line_count(const std::string& out) {
+    std::size_t bad = 0;
+    std::size_t start = 0;
+    while (start < out.size()) {
+        const std::size_t nl = out.find('\n', start);
+        if (nl == std::string::npos) { ++bad; break; }
+        if (!ts_shape_ok(out.substr(start, nl - start))) ++bad;
+        start = nl + 1;
+    }
+    return bad;
+}
+
+void test_log() {
+    // 1) INFO 级别：INFO 输出、DEBUG 被宏过滤
+    set_log_level(LogLevel::INFO);
+    {
+        StderrCapture cap;
+        LOG_INFO("hello");
+        LOG_DEBUG("should not appear");
+        const std::string out = cap.stop();
+        expect_eq(count_lines(out), 1, "log: 1 line at INFO level");
+        expect_eq(count_substr(out, "hello"), 1, "log: INFO emitted");
+        expect_eq(count_substr(out, "should not appear"), 0, "log: DEBUG filtered");
+        expect_eq(count_substr(out, "[INFO ]"), 1, "log: [INFO ] tag padded");
+    }
+
+    // 2) ERROR 级别：INFO 被过滤、ERROR 输出
+    {
+        set_log_level(LogLevel::ERROR);
+        StderrCapture cap;
+        LOG_INFO("nope");
+        LOG_ERROR("boom");
+        const std::string out = cap.stop();
+        expect_eq(count_lines(out), 1, "log: 1 line at ERROR level");
+        expect_eq(count_substr(out, "nope"), 0, "log: INFO filtered at ERROR level");
+        expect_eq(count_substr(out, "boom"), 1, "log: ERROR emitted");
+        expect_eq(count_substr(out, "[ERROR]"), 1, "log: [ERROR] tag");
+    }
+
+    // 3) 连接上下文 + 标签对齐 + 消息格式化 + 全局消息省略 [fd=… ip=…]
+    set_log_level(LogLevel::INFO);
+    {
+        StderrCapture cap;
+        LOG_INFO_C(12, "192.168.1.10", "file=%s size=%u", "a.txt", 7U);
+        LOG_WARN("warn-global");
+        LOG_INFO("info-global");
+        const std::string out = cap.stop();
+        expect_eq(count_lines(out), 3, "log: 3 lines");
+        expect_eq(count_substr(out, "[fd=12 ip=192.168.1.10]"), 1, "log: conn segment");
+        expect_eq(count_substr(out, "file=a.txt size=7"), 1, "log: printf formatting");
+        expect_eq(count_substr(out, "[WARN ]"), 1, "log: [WARN ] tag padded");
+        expect_eq(count_substr(out, "[fd="), 1, "log: global lines omit conn segment");
+        expect_eq(bad_line_count(out), 0, "log: timestamp shape on all lines");
+    }
+
+    // 4) 并发写入：4 线程 × 50 行，行数正确且无交错
+    {
+        StderrCapture cap;
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; ++t) {
+            threads.emplace_back([t] {
+                char ip[32];
+                std::snprintf(ip, sizeof ip, "10.0.0.%d", t + 1);
+                for (int i = 0; i < 50; ++i) {
+                    LOG_INFO_C(100 + t, ip, "line %d", i);
+                }
+            });
+        }
+        for (std::thread& th : threads) th.join();
+        const std::string out = cap.stop();
+        expect_eq(count_lines(out), 200, "log: 200 lines from 4 threads x 50");
+        expect_eq(count_substr(out, "[INFO ]"), 200, "log: one [INFO ] tag per line");
+        expect_eq(bad_line_count(out), 0, "log: no interleaved/corrupt lines");
+    }
+
+    set_log_level(LogLevel::INFO);   // 复位
+}
+
 }  // namespace
 
 int main() {
@@ -202,6 +361,8 @@ int main() {
     test_md5_million_a();
     test_md5_split_equivalence();
     test_md5_reset_reuse();
+
+    test_log();
 
     if (g_failures == 0) {
         std::printf("selftest: all checks passed\n");
