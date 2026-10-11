@@ -39,7 +39,7 @@ void Connection::send_frame(std::string_view /*bytes*/) {
 }
 
 bool Connection::out_empty() const {
-    // TODO(step 5): 语义待定（sent_off == out_buf.size()），先返回 true 让骨架可编译。
+    // TODO(step 5): 语义已定（架构 §6.5 语义 A）→ out_buf.empty()；仍需在 send_mu 下读。
     return true;
 }
 

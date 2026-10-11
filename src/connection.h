@@ -85,7 +85,7 @@ public:
     void finalize();                          // 仅 IO 线程；幂等（架构 §7.4）
     void update_interest();                   // 需持 send_mu；计算并 MOD epoll 掩码（架构 §6.1）
     void send_frame(std::string_view bytes);  // worker 与 IO 均可（架构 §6.5）
-    bool out_empty() const;                   // 需持 send_mu
+    bool out_empty() const;                   // 需持 send_mu；≡ out_buf.empty()（架构 §6.5 语义 A）
 
     // ---------- 字段 ----------
 
@@ -119,8 +119,7 @@ public:
 
     // 6) 受 send_mu 保护（发送路径 + epoll 兴趣位）
     mutable std::mutex send_mu;
-    std::string out_buf;
-    std::size_t sent_off = 0;
+    std::string out_buf;                   // 仅未发送字节；已发部分即时 erase（架构 §6.5 语义 A）
     bool paused_in = false;                // 高水位摘 EPOLLIN 标志（架构 §6.1）
     uint32_t epoll_events = 0;             // 当前已注册掩码
 
