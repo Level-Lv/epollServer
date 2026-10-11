@@ -1,6 +1,7 @@
-// connection.h — Connection / FileSession / MsgTask 结构定义（骨架，步骤 4A）
-// 依据：架构文档 §7.1（字段清单与所有权）、§5.1（调度状态）、§6.4（解析状态机）；
-//       PRD §6（会话状态机）。方法实现见架构 §6.5 / §7.4（步骤 5 落地）。
+// connection.h — Connection / FileSession / MsgTask 结构定义（步骤 4A + 5）
+// 依据：架构文档 §7.1（字段清单与所有权）、§5.1（调度状态）、§6.4（解析状态机）、
+//       §6.1 / §6.5（三个 *_locked 原语，路线 C）；PRD §6（会话状态机）。
+//       finalize / send_frame / update_interest 归 server 层（步骤 6）。
 //
 // 并发所有权约定（架构 §4.2 / §7.1）：每个字段组的访问规则标注在字段上方，
 // 实现时不得偏离。允许的锁序（只能从左到右）：
@@ -81,15 +82,16 @@ public:
     Connection(Connection&&) = delete;
     Connection& operator=(Connection&&) = delete;
 
-    // ---------- 方法（步骤 5 实现） ----------
-    void finalize();                          // 仅 IO 线程；幂等（架构 §7.4）
-    void update_interest();                   // 需持 send_mu；计算并 MOD epoll 掩码（架构 §6.1）
-    void send_frame(std::string_view bytes);  // worker 与 IO 均可（架构 §6.5）
-    bool out_empty() const;                   // 需持 send_mu；≡ out_buf.empty()（架构 §6.5 语义 A）
+    // ---------- 方法（步骤 5，路线 C：仅三个 *_locked 原语） ----------
+    // 以下三个方法均假定调用方已持 send_mu；本类不做存活核对、不调 epoll、
+    // 不标记断开——那些属 server 层（finalize / send_frame / update_interest，步骤 6）。
+    bool out_empty_locked() const;                        // ≡ out_buf.empty()（架构 §6.5 语义 A）
+    uint32_t compute_interest_locked() const;             // 纯计算掩码（架构 §6.1 公式），无 IO
+    bool append_and_send_locked(std::string_view bytes);  // append + 直发至 EAGAIN；false = 硬错误
 
     // ---------- 字段 ----------
 
-    // 1) 不可变（构造后身份不再变化）
+    // 1) 身份字段：构造后只读；仅 finalize（IO 线程，conns_mu_ 下，§7.4）可改写为 -1
     int fd;
     std::string peer_ip;  // 点分十进制 IPv4
     uint16_t peer_port;   // 主机字节序
@@ -100,7 +102,6 @@ public:
     ParseState parse_state = ParseState::NEED_HEADER;
     uint32_t pending_body_len = 0;         // NEED_BODY 时的目标长度
     uint8_t pending_type = 0;              // NEED_BODY 时的帧类型（MsgType 值）
-    bool peer_eof = false;                 // RDHUP/读到 0 后置位，不再读
 
     // 3) 跨线程（受 state_mu）
     mutable std::mutex state_mu;
@@ -112,6 +113,7 @@ public:
     // 4) 跨线程（atomic；任何 fd 访问前必须先查 closed）
     std::atomic<bool> closed{false};       // 逻辑死亡
     std::atomic<bool> closing{false};      // 冲刷 out_buf 后关闭
+    std::atomic<bool> peer_eof{false};     // RDHUP/读到 0 后置位，不再读（2026-10-12：worker 经 compute 读取，移入本组）
 
     // 5) 受 pool.mu_ 保护（thread_pool.h 的调度器，见架构 §5）
     SchedState sched_state = SchedState::IDLE;

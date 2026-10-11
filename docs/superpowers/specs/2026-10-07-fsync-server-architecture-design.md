@@ -64,8 +64,8 @@ test_client.cpp → common.h, md5.h
 | `log.*`         | `LOG_ERROR/WARN/INFO/DEBUG`，带 conn 上下文的重载        | 日志文件、轮转（PRD §1.2）   |
 | `md5.*`         | `Md5{update,finalize,hex}` 增量接口                      | 通用哈希框架                 |
 | `thread_pool.*` | 调度、背压、worker 生命周期                              | 定时任务、优先级             |
-| `connection.*`  | 连接对象、会话状态机、out_buf 与兴趣位、finalize         | epoll_wait/accept（属 server）|
-| `server.*`      | IO 线程全部逻辑、消息解析与分发入口、启动/退出           | 文件 IO（属 worker 任务）    |
+| `connection.*`  | 连接对象、会话状态机、out_buf 与兴趣位计算（提供 *_locked 原语）         | epoll_wait/accept（属 server）|
+| `server.*`      | IO 线程全部逻辑、消息解析与分发入口、finalize / send_frame / update_interest 的落地、启动/退出           | 文件 IO（属 worker 任务）    |
 
 ## 4. 线程模型与锁序
 
@@ -231,8 +231,10 @@ events = EPOLLRDHUP
 
 - `paused_in`：高水位（out_buf ≥ 8 MiB）置位 → 摘 EPOLLIN；发送冲刷至 ≤ 4 MiB 清零 → 复挂。LT 下暂停期间到达的数据留在内核缓冲，复挂后按层触发补通知，无丢失风险（这正是选 LT 的理由之一）。
 - `closing`：任何关闭路径一旦进入"冲刷中"，不再读新数据（摘 EPOLLIN），但保留 EPOLLOUT 直到 out_buf 清空。
-- `peer_eof`：收到 RDHUP / 读到 0 后置位 → 摘 EPOLLIN（"停止读"，PRD §8.4），由 §6.2 的 RDHUP 分支即时 `update_interest` 落地；LT 下不再对残留数据重复报 EPOLLIN。
+- `peer_eof`：收到 RDHUP / 读到 0 后置位 → 摘 EPOLLIN（"停止读"，PRD §8.4），由 §6.2 的 RDHUP 分支即时 `update_interest` 落地；LT 下不再对残留数据重复报 EPOLLIN。该字段为 `std::atomic<bool>`（2026-10-12 定）：置位只发生在 IO 线程，但 worker 侧 `compute_interest_locked`（发送路径算掩码）也会读取，故不属"IO 独占"组（§7.1）。
 - 与已注册掩码相同则跳过 `epoll_ctl`（`conn->epoll_events` 记录当前掩码）。
+
+`update_interest()` 归属（路线 C，2026-10-12 定）：属 server 层——自取 `conns_mu_` + `send_mu`，掩码计算委托 `Connection::compute_interest_locked()`（纯计算，落点注见 §6.5）；`EPOLL_CTL_MOD` 由 server 执行，成功后回写 `epoll_events`。Connection 侧不含 epoll 调用。
 
 ### 6.2 事件循环骨架
 
@@ -307,32 +309,40 @@ NEED_BODY  : 待 ≥body_len → 切出 body → 组装 MsgTask → submit() →
 `send_frame(conn, header+body)`，worker 与 IO 都可能调用（IO 发协议错误帧时）：
 
 ```cpp
-void send_frame(const shared_ptr<Connection>& c, std::string_view bytes) {
+// 返回 false = 硬发送错误（EPIPE/ECONNRESET…）；标记动作由调用方在锁外完成
+// （state_mu 下置 closed / disconnect_requested）——send_frame 内部不得取
+// state_mu（锁序 §4.2：持 send_mu 时反向取 state_mu 即死锁）。
+bool send_frame(const shared_ptr<Connection>& c, std::string_view bytes) {
     std::lock_guard g1(conns_mu_);
     auto it = conns_.find(c->fd);
-    if (it == conns_.end() || it->second.get() != c.get()) return;  // 已死/复用了 fd 号
+    if (it == conns_.end() || it->second.get() != c.get()) return true;  // 已死/复用了 fd 号：无需标记
     std::lock_guard g2(c->send_mu);
-    c->out_buf.append(bytes);
-    send_direct_locked(c);              // 见图下说明
-    update_interest_locked(c);          // 水位/EPOLLOUT 变化 → 记录新掩码
+    if (!send_direct_locked(c, bytes)) return false;  // append + 直发；false = 硬错误
+    // 硬错误时直接返回：此时连接即将断开，无需更新 epoll 兴趣位
+    // （EPOLL_CTL_DEL 由 IO 侧的 finalize 处理，架构 §7.4）
+    update_interest_locked(c);          // 按当前 out_buf/paused_in 等算新掩码并记录
     if (掩码变了) epoll_ctl(EPOLL_CTL_MOD, c->fd, 新掩码);          // R2 合法
+    return true;
 }
 
-// 需持 send_mu。out_buf 语义（见下"语义 A"）：只保存**未发送**字节。
-// 发送游标是局部变量，每轮 send 成功后把已发前缀从 out_buf 头部 erase；
-// 该变量调用结束即消失，不落成 Connection 字段。
-void send_direct_locked(const shared_ptr<Connection>& c) {
+// 需持 send_mu。先 append(bytes)，再循环直发；out_buf 语义（见下"语义 A"）：
+// 只保存**未发送**字节，发送游标是局部变量，每轮 send 成功后把已发前缀从
+// out_buf 头部 erase，调用结束即消失，不落成 Connection 字段。
+// 返回 false = 硬发送错误（EPIPE/ECONNRESET 等）；**不在此处标记断开**。
+bool send_direct_locked(const shared_ptr<Connection>& c, std::string_view bytes) {
+    c->out_buf.append(bytes);
     size_t sent_total = 0;                       // 本次调用内已完成发送的字节数
+    bool hard_error = false;
     while (sent_total < c->out_buf.size()) {
         ssize_t n = send(c->fd, c->out_buf.data() + sent_total,
                          c->out_buf.size() - sent_total, MSG_NOSIGNAL);
         if (n > 0) { sent_total += size_t(n); continue; }    // 继续排空
         if (n < 0 && errno == EINTR) continue;               // 重试
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;  // 发满内核缓冲
-        // EPIPE/ECONNRESET 等 → 标记断开，交 IO 收尾（§7.5 路径 4 语义）
-        break;
+        hard_error = true; break;                            // EPIPE/ECONNRESET 等
     }
     if (sent_total > 0) c->out_buf.erase(0, sent_total);     // 已发即弃
+    return !hard_error;
 }
 ```
 
@@ -340,10 +350,11 @@ void send_direct_locked(const shared_ptr<Connection>& c) {
   - `out_empty(c)` ≡ `c->out_buf.empty()`；
   - `c->out_buf.size()` 直接就是"待发字节数"，与 §8.3 的高水位（8 MiB）/低水位（4 MiB）判断一一对应，无需再减去任何已发偏移。
   - 取消持久游标的代价：每轮 send 后 erase 已发前缀要 memmove 剩余字节。MVP 服务端响应 ≤ 320B（见下），代价可忽略；将来若要服务端推送大文件，再评估"游标 + 延迟压缩"策略。
-- `update_interest_locked`：out_buf 非空 → 需要 EPOLLOUT；size ≥ 8 MiB → `paused_in=true`；≤ 4 MiB（且已置位）→ 清 `paused_in`。二者在同一处按 out_buf.size() 判定，互补（见 §6.1 公式）。
+- `update_interest_locked`：只按当前状态计算掩码——out_buf 非空 → EPOLLOUT；EPOLLIN 取决于 `closing` / `paused_in` / `peer_eof`（见 §6.1 公式）。`paused_in` 的水位滞环（≥ 8 MiB 置位 / ≤ 4 MiB 且已置位时清零）**不在本函数**——状态转换在 `Connection::append_and_send_locked()` 末尾完成（out_buf 尺寸变化的唯一落点，2026-10-12 定）。
 - 直发失败 `EAGAIN` 只意味着残留字节留给 EPOLLOUT 路径，不算错误。
-- `EPIPE`/`ECONNRESET` 等发送错误 → 标记该 conn 需断开（equivalent 于 EOF 路径，由 IO 收尾）。
+- `EPIPE`/`ECONNRESET` 等硬发送错误 → `send_frame` 返回 false，由**调用方在锁外**标记断开（`state_mu` 下置 `closed` + `disconnect_requested`；worker 侧经 §7.4 移交、IO 侧按 §7.5 收尾）。不能在 `send_frame` 内部标记——持 `send_mu` 时取 `state_mu` 违反锁序（§4.2）。
 - out_buf 实际会很小：MVP 服务端只发 ACK/ERROR/心跳回执（≤ 320B），8 MiB 高水位本质是为未来服务端推送大数据留的机制；实现仍按 PRD §8.3 全量落地。
+- **实现落点（路线 C，2026-10-12 定）**：`send_direct_locked` 即 `Connection::append_and_send_locked()`（append 并入原语；返回 false = 硬错误）、`update_interest_locked` 的掩码计算部分即 `Connection::compute_interest_locked()`（纯计算）、`out_empty(c)` 即 `Connection::out_empty_locked()`；掩码落地（`EPOLL_CTL_MOD`）在 server——`apply_interest_locked()`（假定 `conns_mu_` + `send_mu` 已持，供上方 `send_frame` 内复用，避免对 `conns_mu_` 递归加锁）与 `update_interest()`（自取两锁后调前者）。三个 `*_locked` 原语均假定调用方已持 `send_mu`。
 
 ### 6.6 唤醒机制
 
@@ -358,13 +369,13 @@ void send_direct_locked(const shared_ptr<Connection>& c) {
 
 ```cpp
 class Connection {
-  // 不可变
-  int fd; std::string peer_ip;
+  int fd;      // 仅 finalize（IO 线程，conns_mu_ 下，§7.4）
+               // 可改写为 -1，其余只读
+  std::string peer_ip;
   // --- IO 线程独占（无锁）---
   std::vector<char> in_buf; size_t consumed = 0;
   ParseState parse_state = ParseState::NEED_HEADER;  // NEED_HEADER / NEED_BODY
   uint32_t pending_body_len = 0; uint8_t pending_type = 0;
-  bool peer_eof = false;                             // RDHUP/读到 0 之后不再读
   // --- 跨线程 ---
   mutable std::mutex state_mu;
   SessionState state = SessionState::CONNECTED;      // CONNECTED / RECEIVING（仅 worker 正常流转时写）
@@ -373,6 +384,7 @@ class Connection {
   bool disconnect_requested = false;                 // state_mu：IO 已判定断开但任务在跑，收尾移交
   std::atomic<bool> closed{false};                   // 逻辑死亡：任何 fd 访问前必须检查
   std::atomic<bool> closing{false};                  // 冲刷后关闭（协议错误/会话错误触发）
+  std::atomic<bool> peer_eof{false};                 // RDHUP/读到 0 之后不再读；worker 侧 compute 读取（2026-10-12 移入 atomic）
   // --- pool.mu_ 保护（§5）---
   SchedState sched_state = SchedState::IDLE;
   std::deque<MsgTask> tasks;
@@ -383,6 +395,9 @@ class Connection {
   // 注：架构早期草案有 `size_t sent_off` 字段（发送游标），已废弃——
   // 游标改为 send_direct_locked 内的局部变量，不发出去就不从 out_buf 里去掉（§6.5）。
   bool finalized = false;                            // conns_mu_ 保护：finalize 幂等
+  // 方法面（路线 C，2026-10-12 定）：仅三个 *_locked 原语——out_empty_locked() /
+  // compute_interest_locked() / append_and_send_locked()，均假定调用方已持 send_mu；
+  // finalize / send_frame / update_interest 归 server 层（§6.1 / §6.5 / §7.4）。
 };
 ```
 
@@ -637,8 +652,8 @@ make clean
 2. `md5.{h,cpp}`（用 RFC 1321 测试向量自测：`""`、`"abc"` 等）
 3. `log.{h,cpp}`
 4. `thread_pool.{h,cpp}`（§5 调度器 + 背压）
-5. `connection.{h,cpp}`（结构、发送路径、兴趣位、finalize §7）
-6. `server.{h,cpp}`（epoll 循环、accept、解析、submit、signalfd/eventfd）
+5. `connection.{h,cpp}`（结构 + 三个 *_locked 原语：out_empty / compute_interest / append_and_send——发送路径与兴趣位计算层；均假定已持 send_mu）
+6. `server.{h,cpp}`（epoll 循环、accept、解析、submit、finalize / send_frame / update_interest、signalfd/eventfd）
 7. dispatch：META/CHUNK/END/HEARTBEAT（§8）
 8. 错误映射与四类关闭路径（§7.5/§9）
 9. 优雅退出 + CLI + 统计（§10/§11）
