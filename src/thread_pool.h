@@ -76,6 +76,15 @@ public:
     // 立即释放"），故与 conns_mu_ → pool.mu_ 的顺序约束不构成环。
     void take_pending(std::vector<std::shared_ptr<Connection>>& out);
 
+    // 清扫该连接**仍在排队**的任务并归还额度（架构 §5.4"死连接批量清扫"的同一段
+    // 逻辑，只是由 IO 侧 finalize 驱动）。必要性：连接在任务被执行前就死了时，
+    // 若不清扫，queued_total_ 会永久偏高，最终把 submit() 的 IO 线程卡死。
+    //
+    // 调用方不得持 mu_（本方法自取）；允许此时连接不在 ready_ 里，也允许它仍被
+    // 某个 worker 持着——不变式 queued_total_ == Σ|conn->tasks| 由 mu_ 串行化保证。
+    // 幂等（tasks 空时直接返回）。
+    void drain_conn_tasks(const std::shared_ptr<Connection>& c);
+
 private:
     void worker_loop();
 

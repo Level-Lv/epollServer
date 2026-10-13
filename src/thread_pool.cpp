@@ -82,6 +82,19 @@ void ThreadPool::take_pending(std::vector<std::shared_ptr<Connection>>& out) {
     out.swap(pending_finalize_);  // 取走副本，挂起列表清空（架构 §4.2：取出后立即释放）
 }
 
+void ThreadPool::drain_conn_tasks(const std::shared_ptr<Connection>& c) {
+    // 与 worker_loop 收尾里的"死连接批量清扫"分支同源（那里不能调用本函数：
+    // 它已持 mu_，再取即自锁）。两处都维持 §5.5 的不变式
+    // queued_total_ == Σ|conn->tasks|，且都必须 cv_space_.notify_all()——
+    // 可能正有线程阻塞在 submit() 上等这个额度。
+    std::lock_guard<std::mutex> lk(mu_);
+    if (c->tasks.empty()) return;
+    queued_total_ -= c->tasks.size();
+    c->tasks.clear();
+    c->sched_state = SchedState::IDLE;
+    cv_space_.notify_all();
+}
+
 void ThreadPool::worker_loop() {
     for (;;) {
         std::shared_ptr<Connection> c;

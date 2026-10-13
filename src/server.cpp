@@ -1,15 +1,16 @@
-// server.cpp — Server 实现（6A 基础设施 + 6B 连接事件 + 6C1 发送路径）
+// server.cpp — Server 实现（6A 基础设施 + 6B 连接事件 + 6C1 发送路径 + 6C2 收尾路径）
 // 依据：架构文档 §6.1（epoll 集合）、§6.2（事件循环）、§6.3（accept）、§6.4（接收与
-//       解析）、§6.5（发送路径）、§6.6（eventfd/signalfd）、§11.1（启动序列）、
-//       §11.2（优雅退出）、§15-D2/D4/D5/D8/D12/D14；PRD §8.4（SIGPIPE）、
-//       §10.2（退出码）、§11（日志）、§12（生命周期）。
+//       解析）、§6.5（发送路径）、§6.6（eventfd/signalfd）、§7.4（finalize 与延迟
+//       收尾移交）、§7.5（四类关闭路径）、§11.1（启动序列）、§11.2（优雅退出）、
+//       §15-D2/D4/D5/D8/D12/D14；PRD §8.4（SIGPIPE）、§10.2（退出码）、§11（日志）、
+//       §12（生命周期）。
 //
-// 6C1 范围：send_frame / update_interest / apply_interest_locked 的正式实现
-// （架构 §6.5 路线 C）。发送路径至此闭环，但**暂时没有调用者**：worker 侧 dispatch
-// 是第 7 步，静态校验与错误帧 send_error 是第 8 步。
+// 6C2 范围：finalize（幂等收尾）/ close_connection（defer 判定 + 移交）/
+// on_writable（冲刷 out_buf）/ drain_eventfd 消费 pending_finalize_；
+// 并删除 6B 的临时收尾 close_connection_brutal，其调用点全部改走 close_connection。
+// 至此"连接生命周期 + fd 安全"（架构 §7）闭环。
 // 待落地（TODO 标注了负责的子步骤）：
-//   - finalize / close_connection / drain_eventfd 接 take_pending → 6C2
-//     （当前关闭连接仍走 6B 的 close_connection_brutal，recv 硬错误只置 closing）；
+//   - 静态校验与错误帧 send_error（第 8 步；recv 硬错误目前只置 closing）；
 //   - worker 侧 dispatch（execute 仍是占位：任务被取出后丢弃）→ 第 7 步。
 
 #include "server.h"
@@ -206,7 +207,7 @@ void Server::run() {
             if (evs[i].events & (EPOLLERR | EPOLLHUP)) {
                 LOG_WARN_C(c->fd, c->peer_ip.c_str(), "epoll 报错（events=0x%x），断开",
                            evs[i].events);
-                close_connection_brutal(c);  // TODO(6C2)：改走 finalize(c)
+                close_connection(c);  // §7.5：直接断开，不冲刷
                 continue;
             }
 
@@ -221,17 +222,15 @@ void Server::run() {
                     out_empty = c->out_empty_locked();
                 }
                 if (out_empty) {
-                    close_connection_brutal(c);  // TODO(6C2)：改走 finalize(c)
+                    close_connection(c);  // §7.5：out_buf 空 → 立即收尾
                     continue;
                 }
-                // out_buf 非空：6B 无发送路径，恒不会走到；6C 由 EPOLLOUT 冲刷后收尾。
+                // out_buf 非空：EPOLLOUT 已由上面的 update_interest 按 out_buf 挂上，
+                // 交给 on_writable 冲刷空后再收尾（§7.5 的 RDHUP 行）。
             }
 
             if (evs[i].events & EPOLLOUT) {
-                // 6B：out_buf 恒空（worker 侧 execute 是占位，尚无发送路径），EPOLLOUT
-                // 本就不该挂上；真收到也只重算一次掩码把它摘掉。
-                // TODO(6C2)：换成 on_writable(c) 的正式冲刷 + 发空后按 peer_eof 收尾。
-                update_interest(c);
+                on_writable(c);  // 冲刷 out_buf；发空且 peer_eof → 收尾
             }
 
             if (evs[i].events & EPOLLIN) {
@@ -296,7 +295,9 @@ void Server::on_accept() {
         if (::epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
             LOG_ERROR_C(c->fd, c->peer_ip.c_str(), "epoll_ctl(ADD) 失败：%s",
                         std::strerror(errno));
-            close_connection_brutal(c);  // 已入表：走同一收尾路径摘除 + close
+            // 已入表但未注册成功：走统一收尾路径（刚 accept 的连接没有 worker 在跑，
+            // 故 close_connection 会直通 finalize，不会走移交）
+            close_connection(c);
             continue;
         }
         c->epoll_events = EPOLLIN | EPOLLRDHUP;
@@ -319,7 +320,16 @@ void Server::drain_eventfd() {
         }
         break;  // EAGAIN：已排空
     }
-    // TODO(6C2)：pool_.take_pending(list) → 逐个 finalize(c)（架构 §7.4 延迟收尾）
+
+    // 消费 worker 移交的延迟收尾（架构 §7.4 时间线）：
+    // wake_io_cb_ 写 eventfd ↔ 这里的 take_pending 一一对应；take_pending 是 swap
+    // 语义（列表副本已从 ThreadPool 摘走），故 finalize 里做 unlink/close 这类
+    // 可能阻塞的动作不会挡住 worker。
+    std::vector<ConnectionPtr> pending;
+    pool_.take_pending(pending);
+    for (const auto& c : pending) {
+        finalize(c);
+    }
 }
 
 void Server::handle_signal() {
@@ -375,9 +385,11 @@ void Server::on_readable(const ConnectionPtr& c) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
         // 其它错误（ECONNRESET…）：标记断开，交由关闭路径收尾
         LOG_WARN_C(c->fd, c->peer_ip.c_str(), "recv 失败：%s", std::strerror(errno));
-        c->closing = true;  // TODO(6C2)：改走正式收尾路径（冲刷 out_buf 后关闭）
-        // 同上：closing 置位后 compute_interest_locked() 会摘掉 EPOLLIN，避免这条
-        // "只标记、不关闭"的临时路径在 LT 下忙转（6C 接上正式收尾后即可去掉）。
+        c->closing = true;
+        // TODO(第 8 步)：接上 send_error 后，这里改走 §7.5 的"协议/会话错误"正式路径
+        // —— 冲刷 out_buf 空后 close_connection（而不是只置 closing、靠 ERR/HUP 兜底）。
+        // 现在这样写是临时态：closing 置位后 compute_interest_locked() 会摘掉 EPOLLIN，
+        // 故不会在 LT 下忙转，但连接要等 EPOLLERR|EPOLLHUP 到达才真正收尾。
         update_interest(c);
         break;
     }
@@ -502,52 +514,129 @@ bool Server::send_frame(const ConnectionPtr& c, std::string_view bytes) {
 }
 
 // ---------------------------------------------------------------------------
-// 6B 临时收尾（TODO(6C2)：由 finalize() 取代后删除）
+// 6C2：收尾路径（架构 §7.4 延迟收尾移交 / §7.5 四类关闭触发）
 // ---------------------------------------------------------------------------
 
-void Server::close_connection_brutal(const ConnectionPtr& c) {
-    // 6B 临时收尾（TODO(6C2)：由 finalize() 取代后删除）：
-    //   EPOLL_CTL_DEL + close(fd) + 从 conns_ 摘除 + fd 置 -1，不冲刷、不移交。
-    // 只在 IO 线程调用；本步 execute() 还是占位（不建 FileSession），故无临时文件要
-    // unlink —— 真有会话时 ~FileSession::cleanup() 仍会兜底。
-    // TODO(6C2)：finalize() 必须在此基础上前置 FileSession::cleanup()
-    //           （close tmp_fd + unlink tmp_path），否则会话中断时残留 .part 文件。
-    if (c->closed.exchange(true)) return;  // 幂等：已收尾则直接返回
+void Server::close_connection(const ConnectionPtr& c) {
+    // IO 侧统一关闭入口。步骤固定为：置 closed → 摘 epoll → defer 判定后二选一。
+    bool defer;
+    {
+        // closed 与 task_running 必须在同一临界区里读改写：execute() 入口也在
+        // state_mu 下"先查 closed 再置 task_running"（架构 §8），二者靠这把锁串行化，
+        // 因此本函数返回后不可能再有 worker 开始碰这个会话（I1/I2）。
+        std::lock_guard<std::mutex> g(c->state_mu);
+        c->closed = true;  // 逻辑死亡：worker 取出任务时据此丢弃
+        defer = c->task_running;
+        if (defer) {
+            c->disconnect_requested = true;  // worker 收尾时把 c 移交回 IO（§7.4）
+        }
+    }
 
-    const int fd = c->fd;  // 置 -1 前留存，供日志与 close 使用
+    // 先摘 epoll（无论 defer 与否）：不再收这个 fd 的事件。fd 本身先不关——
+    // defer 路径下 worker 可能正在 write(session.tmp_fd) 或 send；若此时 close，
+    // fd 号被 accept/打开新文件复用后，worker 会把数据写进无关文件（§7.4 的"为什么"）。
     {
         std::lock_guard<std::mutex> g(conns_mu_);
-        const auto it = conns_.find(fd);
+        const auto it = conns_.find(c->fd);
         if (it != conns_.end() && it->second.get() == c.get()) {
-            ::epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
-            conns_.erase(it);
+            ::epoll_ctl(epfd_, EPOLL_CTL_DEL, c->fd, nullptr);  // ENOENT 忽略
         }
-        // fd 的 close 与置 -1 都在 conns_mu_ 下完成（架构 §7.1 的所有权约定）；
-        // 置 -1 是为了让 ~Connection 的兜底 close 不会二次关闭已被复用的 fd 号。
-        if (fd >= 0) {
-            ::close(fd);
-            c->fd = -1;
-        }
+    }
+
+    if (!defer) {
+        finalize(c);  // 无任务在跑：就地收尾，无移交开销（§7.4 末段）
+    }
+    // defer 路径：等 worker 收尾时 push 进 pending_finalize_ + 写 eventfd，
+    // IO 线程在 drain_eventfd() 里 finalize（§7.4 时间线）。
+}
+
+void Server::finalize(const ConnectionPtr& c) {
+    // 架构 §7.4 / I3：仅 IO 线程调用，幂等。
+    // 前提（I2）：调用方已在 state_mu 下确认 closed==true 且 task_running==false
+    // —— close_connection 保证前者，worker 的收尾移交保证后者。故此处可以安全触碰
+    // FileSession（§7.1：task_running==false 时只有 IO 的 finalize 会清理它）。
+    //
+    // 关键：EPOLL_CTL_DEL / conns_.erase / close / fd=-1 全部在同一个 conns_mu_
+    // 临界区内完成 —— send_frame / update_interest 的存活核对依赖这个原子性，
+    // 否则会出现"表外但 fd 仍有效"或"表内但 fd 已 close"的中间态（§7.6 R2）。
+    std::lock_guard<std::mutex> g1(conns_mu_);
+    if (c->finalized) return;
+    c->finalized = true;
+
+    const int fd = c->fd;  // 置 -1 前留存（日志与 close 用）
+    if (fd >= 0) {
+        ::epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);  // 可能已 DEL 过：ENOENT 忽略
+    }
+    const auto it = conns_.find(fd);
+    if (it != conns_.end() && it->second.get() == c.get()) {
+        conns_.erase(it);  // 此后 lookup 不再命中（I4 的陈旧事件防线）
+    }
+
+    // 清理 FileSession：close(tmp_fd) + unlink(tmp_path)（PRD §6.3 / AC-4）。
+    // cleanup() 幂等，且不判 active 也安全（active==false 时最坏是一次空转，
+    // 但能兜住"tmp_path 已置而 active 未置"这类半初始化残留）。锁序
+    // conns_mu_ → state_mu（§4.2 允许的嵌套）。
+    {
+        std::lock_guard<std::mutex> g2(c->state_mu);
+        c->session.cleanup();
+    }
+
+    // 清扫仍排在该连接上的任务并归还 queued_total_ 额度（架构 §5.4/§5.5 不变式）。
+    // 独立作用域：state_mu 与 pool.mu_ 不同链，不得同时持有（§4.2）。
+    // 不移交时若不清扫，额度会永久偏高，最终把 submit() 的 IO 线程卡死。
+    pool_.drain_conn_tasks(c);
+
+    c->closed = true;  // 通常早已为 true（drain_eventfd 路径亦然），此处兜底
+    if (fd >= 0) {
+        ::close(fd);   // I2：conn fd 的唯一 close 点
+        c->fd = -1;    // 防 ~Connection 二次 close（fd 号可能已被内核复用）
     }
     LOG_INFO_C(fd, c->peer_ip.c_str(), "连接关闭");
 }
 
 // ---------------------------------------------------------------------------
-// 占位实现（6C/6D 落地；本步不参与任何实际路径）
+// 6C2：冲刷（架构 §6.2 / §6.5）
 // ---------------------------------------------------------------------------
 
-void Server::on_writable(const ConnectionPtr& /*c*/) {
-    // TODO(6C2)：直发 out_buf；发空后按 peer_eof 决定 finalize（架构 §6.2/§6.5）
+void Server::on_writable(const ConnectionPtr& c) {
+    // EPOLLOUT 到来说明内核发送缓冲又有空间：冲刷 out_buf。
+    // 复用 send_frame 的发送循环（append 空串是 no-op，只跑直发段），避免重写一份
+    // "只发不 append"的实现；它内部顺带落地新掩码（发空即摘 EPOLLOUT）。
+    if (!send_frame(c, {})) {
+        // 硬错误：send_frame 已返回、此刻不持任何锁，故可安全取 state_mu 标记断开
+        // （架构 §6.5：标记动作必须在 send_frame 之外——持 send_mu 时反向取
+        // state_mu 即死锁）。
+        {
+            std::lock_guard<std::mutex> g(c->state_mu);
+            c->closed = true;                // 逻辑死亡：worker 丢弃余下任务
+            c->disconnect_requested = true;  // worker 收尾时移交 IO
+        }
+        // 收口走统一入口：无任务在跑就立即 finalize，有任务在跑则保持 fd 打开
+        close_connection(c);
+        return;
+    }
+
+    // 冲刷后检查能否收尾（§7.5 的 RDHUP 行）：peer_eof 且 out_buf 已空 → 关闭。
+    //
+    // 这里**不**自己判 task_running：close_connection 内部已有 defer 判定（任务在跑
+    // → 置 disconnect_requested 移交；不在跑 → 就地 finalize）。提前 return 会漏掉
+    // "任务在跑 + peer_eof + out_buf 空"这一组合——那个 worker 此后没有任何唤醒，
+    // 连接只剩 EPOLLRDHUP，收尾就得依赖"RCV_SHUTDOWN 保持时内核会持续上报 RDHUP"
+    // 这种细微语义兜着。走 defer 则由 worker 收尾时主动把 c 推进 pending_finalize_。
+    bool need_close = false;
+    {
+        std::lock_guard<std::mutex> g(c->state_mu);
+        std::lock_guard<std::mutex> g2(c->send_mu);  // 锁序 state_mu → send_mu（§4.2）
+        need_close = c->peer_eof.load() && c->out_empty_locked();
+    }
+    if (need_close) {
+        close_connection(c);
+    }
 }
 
-void Server::close_connection(const ConnectionPtr& /*c*/) {
-    // TODO(6C2)：四类关闭路径的收尾动作（架构 §7.5 / §9）
-}
-
-void Server::finalize(const ConnectionPtr& /*c*/) {
-    // TODO(6C2)：幂等收尾 —— EPOLL_CTL_DEL + close + FileSession 清理 + fd 置 -1
-    //           + 从 conns_ 摘除（架构 §7.4）
-}
+// ---------------------------------------------------------------------------
+// 占位实现（6D 落地；本步不参与任何实际路径）
+// ---------------------------------------------------------------------------
 
 void Server::on_grace_timeout() {
     // TODO(6D)：宽限到期 → 强关全部残余连接（架构 §11.2 步骤 3）
