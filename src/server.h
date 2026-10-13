@@ -102,23 +102,25 @@ private:
     // ---------- 事件处理 ----------
     void on_accept();                          // 6A/6B 已实现：accept4 + 建 Connection 入表
     void on_readable(const ConnectionPtr&);    // 6B 已实现：recv 排空 + parse_loop
-    void on_writable(const ConnectionPtr&);    // TODO(6C)：冲刷 out_buf（6B out_buf 恒空）
+    void on_writable(const ConnectionPtr&);    // TODO(6C2)：冲刷 out_buf（6B out_buf 恒空）
     void parse_loop(const ConnectionPtr&);     // 6B 已实现：两阶段帧状态机（架构 §6.4）
 
     // ---------- 收尾与发送（归 server 层，架构 §6.5 / §7.4） ----------
     // 6B 临时收尾：EPOLL_CTL_DEL + close + 摘表，无冲刷、无 FileSession 清理。
-    // TODO(6C)：由 finalize()（幂等 + session 清理 + 延迟收尾移交）取代后删除。
+    // TODO(6C2)：由 finalize()（幂等 + session 清理 + 延迟收尾移交）取代后删除。
     void close_connection_brutal(const ConnectionPtr&);
-    void close_connection(const ConnectionPtr&);  // TODO(6C)：四类关闭路径收尾
-    bool send_frame(const ConnectionPtr&, std::string_view);  // TODO(6C)：true = 无硬错误
-    // 6B 临时接线（唯一调用点是 RDHUP 摘 EPOLLIN）。TODO(6C)：补存活核对，
-    // 并把掩码落地部分抽成 apply_interest_locked() 供 send_frame 复用。
+    void close_connection(const ConnectionPtr&);  // TODO(6C2)：四类关闭路径收尾
+    // 6C1 已实现：conns_mu_ → send_mu → append_and_send_locked → apply_interest_locked；
+    // true = 无硬错误（硬错误只返回 false，标记由调用方在锁外完成）。
+    bool send_frame(const ConnectionPtr&, std::string_view);
+    // 6C1 已实现：自取 conns_mu_ + send_mu，核对存活后调 apply_interest_locked。
     void update_interest(const ConnectionPtr&);
-    void apply_interest_locked(const ConnectionPtr&);  // TODO(6C)：前置 conns_mu_+send_mu
-    void finalize(const ConnectionPtr&);          // TODO(6C)：幂等摘除 + 清理
+    // 6C1 已实现：假定 conns_mu_ + send_mu 已持（供 send_frame / update_interest 复用）。
+    void apply_interest_locked(const ConnectionPtr&);
+    void finalize(const ConnectionPtr&);          // TODO(6C2)：幂等摘除 + 清理
 
     // ---------- 内部 fd 与退出 ----------
     void handle_signal();    // 6A 已实现：排空 signalfd + running_ = false
-    void drain_eventfd();    // 6A 已实现：读空 eventfd（6C 再接 pending_finalize_）
+    void drain_eventfd();    // 6A 已实现：读空 eventfd（6C2 再接 pending_finalize_）
     void on_grace_timeout(); // TODO(6D)：宽限到期强关剩余连接（架构 §11.2）
 };
