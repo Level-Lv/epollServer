@@ -1,17 +1,19 @@
-// server.h — Server：监听/epoll/eventfd/signalfd 基础设施与事件循环（步骤 6A 骨架）
-// 依据：架构文档 §6.1（epoll 集合与兴趣位）、§6.2（事件循环骨架）、§6.6（唤醒机制）、
-//       §11.1（启动序列）、§11.2（优雅退出）、§15-D2（LT）、§15-D5（两个内部 fd）、
-//       §15-D11（--threads 回退 4）、§15-D14（accept 遇 EMFILE）；
+// server.h — Server：监听/epoll/eventfd/signalfd 基础设施与事件循环（步骤 6A + 6B）
+// 依据：架构文档 §6.1（epoll 集合与兴趣位）、§6.2（事件循环骨架）、§6.3（accept）、
+//       §6.4（接收与解析）、§6.6（唤醒机制）、§11.1（启动序列）、§11.2（优雅退出）、
+//       §15-D2（LT）、§15-D4（IO 线程独占 ADD/DEL）、§15-D5（两个内部 fd）、
+//       §15-D11（--threads 回退 4）、§15-D12（body 拷贝一次）、§15-D14（EMFILE 退让）；
 //       PRD §10.1（CLI 默认值）、§10.2（退出码 2）、§11（日志点）、§12（生命周期）。
 //
-// 本步（6A）只落地"启动 / 退出基础设施 + 主循环骨架"：
-//   - 构造：socket / SO_REUSEADDR / bind / listen + epoll_create1 + eventfd + signalfd
+// 已落地：
+//   - 6A 构造：socket / SO_REUSEADDR / bind / listen + epoll_create1 + eventfd + signalfd
 //           + 三个 fd 入 epoll + mkdir storage_dir + 启动 ThreadPool；
-//   - run()：epoll_wait(-1) 主循环；listen_fd 走 on_accept（accept4 后立即 close，
-//           不建 Connection、不注册 epoll，仅验证 accept 通路）；
-//           eventfd_ / signalfd_ 分别排空。
-// 事件分发（6B）、解析与收尾（6C）、宽限退出（6D）由后续子步骤补齐，
-// 占位实现见 server.cpp 的 TODO 标记。
+//           run()：epoll_wait(-1) 主循环 + eventfd/signalfd 排空 + 退出统计。
+//   - 6B 连接事件（happy path）：on_accept 建 Connection 入表并挂 EPOLLIN|EPOLLRDHUP、
+//           on_readable recv 排空 + parse_loop 两阶段切帧（D12 拷贝）+ submit、
+//           run() 内 ERR/HUP 与 RDHUP 的临时收尾（close_connection_brutal）。
+// 未落地（TODO 标注）：静态校验与错误帧、send_frame / apply_interest_locked /
+// finalize 的正式实现（6C），宽限退出（6D），worker 侧 dispatch（第 7 步）。
 #pragma once
 
 #include <atomic>
@@ -97,16 +99,21 @@ public:
     } stats_;
 
 private:
-    // ---------- 事件处理（6B/6C/6D 逐步落地；本步均为占位） ----------
-    void on_accept();                          // 6A 已实现：accept4 + 立即 close
-    void on_readable(const ConnectionPtr&);    // TODO(6B)：recv 排空 + parse_loop
-    void on_writable(const ConnectionPtr&);    // TODO(6B)：冲刷 out_buf
-    void parse_loop(const ConnectionPtr&);     // TODO(6B)：两阶段帧状态机（架构 §6.4）
+    // ---------- 事件处理 ----------
+    void on_accept();                          // 6A/6B 已实现：accept4 + 建 Connection 入表
+    void on_readable(const ConnectionPtr&);    // 6B 已实现：recv 排空 + parse_loop
+    void on_writable(const ConnectionPtr&);    // TODO(6C)：冲刷 out_buf（6B out_buf 恒空）
+    void parse_loop(const ConnectionPtr&);     // 6B 已实现：两阶段帧状态机（架构 §6.4）
 
     // ---------- 收尾与发送（归 server 层，架构 §6.5 / §7.4） ----------
+    // 6B 临时收尾：EPOLL_CTL_DEL + close + 摘表，无冲刷、无 FileSession 清理。
+    // TODO(6C)：由 finalize()（幂等 + session 清理 + 延迟收尾移交）取代后删除。
+    void close_connection_brutal(const ConnectionPtr&);
     void close_connection(const ConnectionPtr&);  // TODO(6C)：四类关闭路径收尾
     bool send_frame(const ConnectionPtr&, std::string_view);  // TODO(6C)：true = 无硬错误
-    void update_interest(const ConnectionPtr&);   // TODO(6C)：自取两锁后调 apply_*
+    // 6B 临时接线（唯一调用点是 RDHUP 摘 EPOLLIN）。TODO(6C)：补存活核对，
+    // 并把掩码落地部分抽成 apply_interest_locked() 供 send_frame 复用。
+    void update_interest(const ConnectionPtr&);
     void apply_interest_locked(const ConnectionPtr&);  // TODO(6C)：前置 conns_mu_+send_mu
     void finalize(const ConnectionPtr&);          // TODO(6C)：幂等摘除 + 清理
 
