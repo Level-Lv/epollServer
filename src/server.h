@@ -1,4 +1,5 @@
-// server.h — Server：监听/epoll/eventfd/signalfd 基础设施与事件循环（6A + 6B + 6C + 6D）
+// server.h — Server：监听/epoll/eventfd/signalfd 基础设施、事件循环与 worker 侧消息处理
+//            （6A + 6B + 6C + 6D + 7A）
 // 依据：架构文档 §6.1（epoll 集合与兴趣位）、§6.2（事件循环骨架）、§6.3（accept）、
 //       §6.4（接收与解析）、§6.5（发送路径）、§6.6（唤醒机制）、§7.4（finalize 与
 //       延迟收尾移交）、§7.5（四类关闭路径）、§11.1（启动序列）、§11.2（优雅退出）、
@@ -17,7 +18,14 @@
 //         drain_eventfd 消费 pending_finalize_。
 //   - 6D：优雅退出 —— shutting_down_/grace_deadline_ 两个字段、handle_signal 软停、
 //         run() 的宽限 timeout、on_grace_timeout 强关残余连接 + join 线程池。
-// 未落地（TODO 标注）：静态校验与错误帧 send_error（第 8 步）、worker 侧 dispatch（第 7 步）。
+//   - 7A：worker 侧消息处理 happy path —— execute（closed/task_running 入口）→
+//         dispatch → FILE_META（§8.2 九步）/ FILE_CHUNK（§8.3）；协议构造
+//         build_frame / send_ack / send_error；文件名清洗、按 IP 建目录、
+//         statvfs 空间检查、tmp 路径生成。execute() 经 ThreadPool 的 execute_cb_
+//         注入（见 thread_pool.h）。
+// 未落地（TODO 标注）：FILE_END（7B）/ HEARTBEAT（7C）、IO 侧静态校验（第 8 步）、
+// "closing 且 out_buf 冲刷空 → finalize"的接线（第 8 步；7A 的 worker 错误路径只置
+// closing + 摘 EPOLLIN，连接靠对端 RDHUP/ERR 兜底收尾，与 6B 的临时行为一致）。
 #pragma once
 
 #include <atomic>
@@ -90,6 +98,14 @@ public:
 
     // 声明顺序即初始化顺序：fd 与配置先就位，pool_ 最后启动 worker——
     // 线程一起跑就能看到已完成初始化的 eventfd_（wake_io_cb_ 依赖它）。
+    //
+    // 关于 execute_cb_（7A 起捕获 this 并调用 Server 成员）：它访问的 conns_mu_ /
+    // conns_ / stats_ / storage_dir_ 都**声明在 pool_ 之后**，即构造 pool_（并启动
+    // worker）时它们尚未初始化。这不构成问题，原因不是"顺序恰好"，而是更强的
+    // "worker 在构造完成前拿不到任何任务"：唯一的投递口 ThreadPool::submit 只由
+    // IO 线程在 run() → on_readable → parse_loop 里调用，而 run() 必然是构造返回
+    // 之后（由 main / 测试）发起的。因此所有回调（含 wake_io_cb_）都只在 Server
+    // 完全构造之后才可能被调用；worker 在这之前只会阻塞在 cv_work_ 上。
     ThreadPool pool_;
 
     // 连接表：fd → Connection。IO 线程是唯一的 ADD/DEL 方（架构 §15-D4），
@@ -137,6 +153,37 @@ private:
     // 6C2 已实现：幂等收尾（架构 §7.4）—— 仅 IO 线程调用；全程持 conns_mu_，
     //             DEL + 摘表 + session 清理 + 清扫排队任务 + close(fd)。
     void finalize(const ConnectionPtr&);
+
+    // ---------- 7A：worker 侧消息处理（架构 §8） ----------
+    // 全部由 execute_cb_ 注入后在 worker 线程上执行。入口 execute 负责 §8 的
+    // closed/task_running 临界区；task_running 的清零由 worker_loop 收尾负责。
+    void execute(const ConnectionPtr&, const MsgTask&);
+    void dispatch(const ConnectionPtr&, const MsgTask&);
+    void handle_file_meta(const ConnectionPtr&, const std::string& body);   // §8.2
+    void handle_file_chunk(const ConnectionPtr&, const std::string& body);  // §8.3
+    void handle_file_end(const ConnectionPtr&, const std::string& body);    // TODO(7B)
+    void handle_heartbeat(const ConnectionPtr&);                            // TODO(7C)
+    // 会话/协议错误的统一出口（worker 侧）：清理活动会话 → send_error → 置 closing
+    // → 落地兴趣位。调用方调用后必须立即 return，不再做任何后续动作。
+    void fail_connection(const ConnectionPtr&, ErrCode, const std::string& msg);
+
+    // ---------- 7A：协议构造与发送（架构 §8.6） ----------
+    // 帧 = 10B 头 + body；ACK/ERROR body = u32 code | u32 msg_len | msg(≤256B)。
+    static std::string build_frame(MsgType, std::string body);
+    // 二者都返回 send_frame 的结果：false = 硬发送错误（调用方须走
+    // mark_disconnect_after_send_failure，且不再做后续动作）。
+    bool send_ack(const ConnectionPtr&, ErrCode, const std::string& msg = "");
+    bool send_error(const ConnectionPtr&, ErrCode, const std::string& msg = "");
+    // send_frame 返回 false 后的统一标记（架构 §6.5）：state_mu 下置 closed +
+    // disconnect_requested，由 worker_loop 收尾把 c 推进 pending_finalize_ 交回 IO。
+    // **不得**在 worker 侧调 close_connection（那是 IO 线程专用入口）。
+    void mark_disconnect_after_send_failure(const ConnectionPtr&);
+
+    // ---------- 7A：文件系统工具 ----------
+    static bool sanitize_filename(const std::string& name, std::string& out);  // PRD §7.3
+    bool ensure_client_dir(const std::string& ip, std::string& out_dir);       // PRD §7.1
+    static bool check_disk_space(const std::string& dir, uint64_t need_bytes); // PRD §7.4
+    static std::string gen_tmp_path(const std::string& final_path);            // PRD §7.2
 
     // ---------- 内部 fd 与退出 ----------
     // 6D 已实现：排空 signalfd。第一次信号 → 软停（置 shutting_down_ + 摘 listen_fd

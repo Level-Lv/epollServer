@@ -20,15 +20,19 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <random>
 #include <stdexcept>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #include <vector>
 
@@ -47,6 +51,26 @@ constexpr std::size_t kRecvChunk = 256U * 1024U;
 // 退出宽限秒数（架构 §15-D3 / PRD §12）：从收到第一个 SIGINT/SIGTERM 起算，
 // 期间只停止 accept，已建立连接照常处理；到期强关残余连接。
 constexpr unsigned kGraceSeconds = 3;
+
+// ERROR/ACK 的 msg 上限（PRD §9.2 / 架构 §8.6）：超长截断，不报错。
+constexpr std::size_t kMaxErrMsgLen = 256;
+
+// tmp 文件名里随机前缀的位数（PRD §7.2：8 位十六进制）。
+constexpr int kTmpRandHexDigits = 8;
+
+// ACK/ERROR 共用同一 body 布局（架构 §8.6）：u32 code BE | u32 msg_len BE | msg(≤256B)。
+// 两种消息只有 type 不同，故 body 构造抽出来共用。
+std::string status_body(ErrCode code, const std::string& msg) {
+    const std::string m = msg.size() > kMaxErrMsgLen ? msg.substr(0, kMaxErrMsgLen) : msg;
+    std::string body(8 + m.size(), '\0');
+    auto* p = reinterpret_cast<uint8_t*>(body.data());
+    be_put32(p, static_cast<uint32_t>(code));
+    be_put32(p + 4, static_cast<uint32_t>(m.size()));
+    if (!m.empty()) {
+        std::memcpy(body.data() + 8, m.data(), m.size());
+    }
+    return body;
+}
 
 // 写 eventfd：worker→IO 的唤醒通道（架构 §6.6），wake_io_cb_ 与 request_stop 共用。
 // 失败不打印日志（worker 侧热路径）：计数已达上限时说明 fd 本就可读，不丢唤醒；
@@ -100,8 +124,12 @@ Server::Server(const ServerConfig& cfg)
       storage_dir_(cfg.storage_dir),
       // wake_io_cb_ 只写 eventfd_、不置 running_（架构 §7.4 的纯唤醒语义）：
       // 收到唤醒的是 IO 线程，退出与否由它自己决定。
+      // execute_cb_ 捕获 this：两个回调都只在 Server 构造完成之后才可能被调用
+      // （唯一的投递口 submit 只由 IO 线程在 run() 里调用），故捕获时机安全；
+      // 详见 server.h 里 pool_ 声明处的说明。
       pool_(cfg.n_threads, cfg.queue_cap, cfg.conn_queue_cap,
-            [this] { write_eventfd(eventfd_); }) {
+            [this] { write_eventfd(eventfd_); },
+            [this](const ConnectionPtr& c, const MsgTask& t) { execute(c, t); }) {
     // 构造中途失败：析构函数不会执行，统一经 fail() 回收已开 fd 后再抛，
     // 避免 fd 泄漏（close 会覆写 errno，故先取出 e）。
     auto fail = [this](const char* what) {
@@ -758,4 +786,306 @@ void Server::on_grace_timeout() {
     }
 
     running_ = false;
+}
+
+// ---------------------------------------------------------------------------
+// 7A：worker 侧消息处理（架构 §8.1–§8.3）
+//
+// 本节所有 handler 共用的锁规矩（与 §7.1 / §4.2 一致，各函数内不再重复）：
+//   - 状态机字段 state：在 state_mu 下读改写（它按声明属跨线程字段）。
+//   - FileSession 的其余字段（fd / tmp_path / expected_* / received / md5 / active …）
+//     **不加锁**：任务在跑期间 task_running == true，按 §7.1 会话由本 worker 独占；
+//     IO 线程唯一触碰会话的地方是 finalize，而它只在 task_running == false 时发生
+//     （I2），二者不可能重叠。
+//   - 文件 IO（open/write/close/unlink/statvfs）一律在锁外（§4.2）。
+//   - **绝不**在持 state_mu 时调 send_* / update_interest：它们要取 conns_mu_
+//     → send_mu，而合法锁序是 conns_mu_ → state_mu → send_mu（§4.2），反向即死锁。
+//     故每个 handler 都是"锁内取判定，出锁再动作"。
+// ---------------------------------------------------------------------------
+
+void Server::execute(const ConnectionPtr& c, const MsgTask& t) {
+    // 架构 §8 的 execute。入口的 closed 检查与 task_running 置位必须在同一临界区内：
+    // I1 —— 入队后、执行前连接已死则直接丢弃本任务，绝不碰 session（额度由 worker_loop
+    // 的死连接清扫路径归还）。task_running 的清零属 worker_loop 的收尾三步，此处不置。
+    {
+        std::lock_guard<std::mutex> g(c->state_mu);
+        if (c->closed) return;
+        c->task_running = true;  // 此后 session 归本 worker 独占（架构 §7.1）
+    }
+    dispatch(c, t);  // 全程独占 session；文件 IO 不持锁（架构 §4.2）
+}
+
+void Server::dispatch(const ConnectionPtr& c, const MsgTask& t) {
+    switch (static_cast<MsgType>(t.type)) {
+        case MsgType::FILE_META:  handle_file_meta(c, t.body);  break;
+        case MsgType::FILE_CHUNK: handle_file_chunk(c, t.body); break;
+        case MsgType::FILE_END:   handle_file_end(c, t.body);   break;  // TODO(7B)
+        case MsgType::HEARTBEAT:  handle_heartbeat(c);          break;  // TODO(7C)
+        default:
+            // 未知 type 本应由 IO 侧静态校验拦掉（第 8 步）；这里兜底。
+            // 可能发生在会话中途（连接已在 RECEIVING），fail_connection 会清掉 tmp
+            // —— 对应 §9 的 BAD_TYPE 行"若 session.active"。
+            fail_connection(c, ErrCode::BAD_TYPE, "unknown type");
+            break;
+    }
+}
+
+void Server::handle_file_meta(const ConnectionPtr& c, const std::string& body) {
+    // ---- 步骤 1：状态机，仅 CONNECTED 合法（PRD §6.2 / §15-D6）----
+    bool in_receiving;
+    {
+        std::lock_guard<std::mutex> g(c->state_mu);
+        in_receiving = (c->state == SessionState::RECEIVING);
+    }
+    if (in_receiving) {
+        fail_connection(c, ErrCode::BAD_TYPE, "meta while receiving");
+        return;
+    }
+
+    // ---- 步骤 2：解析 + 精确核长（PRD §5.3；精确长度判定按 §8.1 属 worker 层）----
+    if (body.size() < 2) {
+        fail_connection(c, ErrCode::BAD_TYPE, "meta too short");
+        return;
+    }
+    const auto* p = reinterpret_cast<const uint8_t*>(body.data());
+    const std::size_t name_len = be_get16(p);  // ≤ 65535，下面的核长把它钉死在 ≤512
+    if (body.size() != 2 + name_len + 8 + MD5_HEX_LEN) {
+        fail_connection(c, ErrCode::BAD_TYPE, "meta length mismatch");
+        return;
+    }
+    const std::string name = body.substr(2, name_len);
+    const uint64_t expected_size = be_get64(p + 2 + name_len);
+    // md5hex 只原样保存、不提前校验格式（架构 §15-D10）：
+    // 大小写/长度是否合法留到 FILE_END 比对时自然判负（7B）。
+    const std::string expected_md5hex = body.substr(2 + name_len + 8, MD5_HEX_LEN);
+
+    // ---- 步骤 3：文件名清洗（PRD §7.3）----
+    std::string safe_name;
+    if (!sanitize_filename(name, safe_name)) {
+        fail_connection(c, ErrCode::BAD_FILENAME, "bad filename");
+        return;
+    }
+
+    // ---- 步骤 4：按对端 IP 建目录（PRD §7.1：延迟到首个 META 才建）----
+    std::string dir;
+    if (!ensure_client_dir(c->peer_ip, dir)) {
+        const int e = errno;  // 先留存：std::string 的构造可能覆写 errno
+        fail_connection(c, ErrCode::WRITE_FAILED, std::string("mkdir: ") + std::strerror(e));
+        return;
+    }
+
+    // ---- 步骤 5：剩余空间（PRD §7.4；statvfs 失败也归 WRITE_FAILED）----
+    if (!check_disk_space(dir, expected_size)) {
+        fail_connection(c, ErrCode::WRITE_FAILED, "no space");
+        return;
+    }
+
+    // ---- 步骤 6：tmp 文件（PRD §7.2 / §15-D7）：O_EXCL 撞名则换随机数重试 ≤5 次 ----
+    const std::string final_path = dir + "/" + safe_name;
+    int tmp_fd = -1;
+    std::string tmp_path;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        tmp_path = gen_tmp_path(final_path);
+        tmp_fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+        if (tmp_fd >= 0) break;
+        if (errno != EEXIST) break;  // 非撞名错误：换名字重试没有意义
+    }
+    if (tmp_fd < 0) {
+        const int e = errno;
+        fail_connection(c, ErrCode::WRITE_FAILED, std::string("open: ") + std::strerror(e));
+        return;
+    }
+
+    // ---- 步骤 7：建立会话（复用前必已 cleanup，故这里是"整体重写"而非增量改）----
+    c->session.active = true;
+    c->session.filename = safe_name;
+    c->session.tmp_path = tmp_path;
+    c->session.final_path = final_path;
+    c->session.fd = tmp_fd;
+    c->session.expected_size = expected_size;
+    c->session.received = 0;
+    c->session.expected_md5hex = expected_md5hex;
+    c->session.md5.reset();
+    {
+        std::lock_guard<std::mutex> g(c->state_mu);
+        c->state = SessionState::RECEIVING;
+    }
+
+    // ---- 步骤 8：日志（PRD §11）；步骤 9：成功路径不回任何响应（只在 END 后回 ACK）----
+    LOG_INFO_C(c->fd, c->peer_ip.c_str(), "meta: name=%s size=%llu md5=%s", safe_name.c_str(),
+               static_cast<unsigned long long>(expected_size), expected_md5hex.c_str());
+}
+
+void Server::handle_file_chunk(const ConnectionPtr& c, const std::string& body) {
+    // ---- 步骤 1：仅 RECEIVING（PRD §6.1）；顺带核对 active，防半初始化残留 ----
+    bool active_session;
+    {
+        std::lock_guard<std::mutex> g(c->state_mu);
+        active_session = (c->state == SessionState::RECEIVING) && c->session.active;
+    }
+    if (!active_session) {
+        fail_connection(c, ErrCode::NO_SESSION, "no session");
+        return;
+    }
+
+    // ---- 步骤 2：溢出（PRD §7.5 / 架构 §8.3）----
+    if (c->session.received + body.size() > c->session.expected_size) {
+        fail_connection(c, ErrCode::OVERFLOW, "chunk overflow");
+        return;
+    }
+
+    // ---- 步骤 3：循环写满（EINTR 重试；ENOSPC 等一律 WRITE_FAILED）----
+    const char* p = body.data();
+    std::size_t remain = body.size();
+    while (remain > 0) {
+        const ssize_t n = ::write(c->session.fd, p, remain);
+        if (n > 0) {
+            p += n;
+            remain -= static_cast<std::size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        const int e = (n < 0) ? errno : EIO;  // n == 0：理论不可达，按 EIO 报
+        fail_connection(c, ErrCode::WRITE_FAILED, std::string("write: ") + std::strerror(e));
+        return;
+    }
+
+    // ---- 步骤 4：增量 MD5 + 计数（写满后才更新：失败路径不留下半截状态）----
+    c->session.md5.update(body.data(), body.size());
+    c->session.received += body.size();
+}
+
+void Server::handle_file_end(const ConnectionPtr& c, const std::string& body) {
+    // TODO(7B)：架构 §8.4 —— received 核对 → fsync → close → md5 finalize → 比对 →
+    //           rename → chmod → ACK(OK, 服务端 md5hex) → 回 CONNECTED；各失败分支
+    //           清理 tmp 后 ERROR。本步（7A）不实现：收到 FILE_END 无响应，连接保持
+    //           打开，临时文件留在盘上（由 finalize / 对端断开时清理）。
+    (void)c;
+    (void)body;
+}
+
+void Server::handle_heartbeat(const ConnectionPtr& c) {
+    // TODO(7C)：架构 §8.5 —— 仅 CONNECTED 合法，回 ACK(OK)（msg 为空）；RECEIVING 中
+    //           收到按 §15-D6 判 BAD_TYPE。本步（7A）不实现：收到 HEARTBEAT 无响应。
+    (void)c;
+}
+
+void Server::fail_connection(const ConnectionPtr& c, ErrCode code, const std::string& msg) {
+    // 会话/协议错误的统一出口（§7.5 前两行 / §9 表的"tmp 清理"列）。
+    // cleanup() 幂等：NO_SESSION / BAD_FILENAME 这类"无会话"错误到这里是 no-op，
+    // 正对应 §9 表里"无"那一格；有会话时它 close(tmp_fd) + unlink(tmp_path)。
+    c->session.cleanup();
+    {
+        std::lock_guard<std::mutex> g(c->state_mu);
+        c->state = SessionState::CONNECTED;  // 状态机回位（此后不会再解析到帧：closing 摘 EPOLLIN）
+    }
+
+    if (!send_error(c, code, msg)) {
+        mark_disconnect_after_send_failure(c);  // 硬发送错误：按 §6.5 标记，不再做后续动作
+        return;
+    }
+    c->closing = true;
+    // closing → compute_interest_locked 摘掉 EPOLLIN；out_buf 非空（刚塞入的 ERROR）
+    // → 保留 EPOLLOUT，由 on_writable 冲刷。冲刷空后收尾（§7.5 的"冲刷空后 finalize"）
+    // 属第 8 步的接线，本步不接：过渡期连接靠对端 RDHUP/ERR 兜底，与 6B 临时行为一致。
+    update_interest(c);
+}
+
+// ---------------------------------------------------------------------------
+// 7A：协议构造与发送（架构 §8.6）
+// ---------------------------------------------------------------------------
+
+std::string Server::build_frame(MsgType type, std::string body) {
+    // 帧 = 10B 头 + body。body 按值传入，调用方可以 std::move 进来，少一次拷贝。
+    std::string frame(HEADER_SIZE + body.size(), '\0');
+    auto* p = reinterpret_cast<uint8_t*>(frame.data());
+    be_put32(p, PROTOCOL_MAGIC);
+    frame[4] = static_cast<char>(PROTOCOL_VERSION);
+    frame[5] = static_cast<char>(type);
+    be_put32(p + 6, static_cast<uint32_t>(body.size()));
+    if (!body.empty()) {
+        std::memcpy(frame.data() + HEADER_SIZE, body.data(), body.size());
+    }
+    return frame;
+}
+
+bool Server::send_ack(const ConnectionPtr& c, ErrCode code, const std::string& msg) {
+    return send_frame(c, build_frame(MsgType::ACK, status_body(code, msg)));
+}
+
+bool Server::send_error(const ConnectionPtr& c, ErrCode code, const std::string& msg) {
+    return send_frame(c, build_frame(MsgType::ERROR_MSG, status_body(code, msg)));
+}
+
+void Server::mark_disconnect_after_send_failure(const ConnectionPtr& c) {
+    // send_frame 返回 false 之后由调用方执行（架构 §6.5：标记动作必须在 send_frame
+    // 之外——持 send_mu 时反向取 state_mu 即死锁）。worker 侧**不得**调
+    // close_connection（IO 线程专用入口）：这里只标记，收尾由 worker_loop 的
+    // "disconnect_requested → pending_finalize_" 移交路径交回 IO 线程执行。
+    std::lock_guard<std::mutex> g(c->state_mu);
+    c->closed = true;                // 逻辑死亡：后续任务取出即丢弃
+    c->disconnect_requested = true;  // worker 收尾时把 c 推进 pending_finalize_（§7.4）
+}
+
+// ---------------------------------------------------------------------------
+// 7A：文件系统工具（PRD §7.1–§7.4）
+// ---------------------------------------------------------------------------
+
+bool Server::sanitize_filename(const std::string& name, std::string& out) {
+    // PRD §7.3：长度 1..512；不含 '\0'、'/'、'\\'；不含 <0x20 控制字符；
+    // 不等于 "." / ".."；不以 '-' 开头（CLI 误用）。
+    //
+    // 关于"以 '.' 开头"：PRD §7.3 把它与 '-' 并列列为拒绝项（隐藏文件），本实现
+    // **允许** .xxx（如 .gitignore），只拒绝恰好 "." / ".."（§7.3 末条）。
+    // 理由：同步工具同步点文件是常见需求，而拒绝它们不带来任何安全收益——路径
+    // 分隔符、NUL、控制字符与 "."/".." 都已单独拒绝，穿越无从谈起。
+    // 注：这与 PRD §7.3 的"不以下列开头：`.`"一条不一致，需同步修订 PRD。
+    if (name.empty() || name.size() > MAX_FILENAME_LEN) return false;
+    if (name == "." || name == "..") return false;
+    if (name.front() == '-') return false;
+    for (const char raw : name) {
+        const unsigned char ch = static_cast<unsigned char>(raw);
+        if (ch == '\0' || ch == '/' || ch == '\\') return false;
+        if (ch < 0x20) return false;  // 控制字符（含 \n \r \t）
+    }
+    out = name;
+    return true;
+}
+
+bool Server::ensure_client_dir(const std::string& ip, std::string& out_dir) {
+    // PRD §7.1：一级目录按客户端 IPv4 点分十进制命名，首个 META 时按需创建。
+    // 已存在（EEXIST）视为成功——多连接/多文件共用同一目录是常态。
+    out_dir = storage_dir_ + "/" + ip;
+    if (::mkdir(out_dir.c_str(), 0755) < 0 && errno != EEXIST) return false;
+    return true;
+}
+
+bool Server::check_disk_space(const std::string& dir, uint64_t need_bytes) {
+    // PRD §7.4 / 架构 §8.2：size > avail − RESERVE(16MiB) → 拒绝。只检查这一次，
+    // 中途不复查（写中途 ENOSPC 由 handle_file_chunk 的 write 错误分支兜住）。
+    // 返回 false 有两种含义（statvfs 失败 / 空间不足），调用方统一报 WRITE_FAILED。
+    //
+    // 按架构原文的"size > avail − RESERVE"写，而**不**写成等价的
+    // "need_bytes + RESERVE <= avail"：后者在 need_bytes 接近 UINT64_MAX 时无符号
+    // 回绕成一个很小的数，会让声明了天文数字长度的帧（7A 还没有静态校验，body/size
+    // 全由客户端给）绕过空间检查。这里先把 RESERVE 从 avail 里扣掉再做比较，两端都
+    // 不会溢出。
+    struct statvfs vfs {};
+    if (::statvfs(dir.c_str(), &vfs) != 0) return false;
+    const uint64_t avail = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
+    constexpr uint64_t kReserve = 16ULL * 1024 * 1024;
+    if (avail < kReserve) return false;  // 连保留量都不够，一律拒绝
+    return need_bytes <= avail - kReserve;
+}
+
+std::string Server::gen_tmp_path(const std::string& final_path) {
+    // PRD §7.2 / §15-D7：<final_path>.part.<8 位小写 hex>（D7 把 PRD 原文的 <fd> 去掉：
+    // fd 在 open 之前不可知，唯一性改由 O_EXCL + 重试保证，语义等价）。
+    // 随机源只需唯一性，不需要密码学强度：thread_local 的 mt19937 每线程只播种一次，
+    // 避开每次调用构造引擎的开销；真撞名（同 IP 同文件并发）由调用方换随机数重试。
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    static thread_local std::uniform_int_distribution<uint32_t> dist(0, 0xFFFFFFFFu);
+    char suffix[kTmpRandHexDigits + 1];
+    std::snprintf(suffix, sizeof(suffix), "%08x", dist(rng));
+    return final_path + ".part." + suffix;
 }

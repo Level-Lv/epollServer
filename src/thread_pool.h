@@ -28,28 +28,27 @@
 
 #include "connection.h"
 
-// 任务执行入口（架构 §8 的 execute/dispatch）。由 server 侧实现（步骤 7）；
-// 步骤 4B 阶段允许未定义：worker 取到任务后原样放回（见 thread_pool.cpp 的 execute()），
-// 不影响本模块编译与自洽。
-// 前置：调用时 c->task_running 已置 true 且已确认 !c->closed——
-//       此时 FileSession 被本 worker 独占，IO 线程不会触碰（架构 §7.1）。
-void execute(const std::shared_ptr<Connection>& c, const MsgTask& t);
-
 class ThreadPool {
 public:
     // n_threads：worker 数（--threads，回退 4 见架构 §15-D11，由 main 决定后传入）。
     // queue_cap：全局排队任务总数上限（--queue-cap，默认 1024）。
     // conn_queue_cap：每连接排队任务数上限（--conn-queue-cap，默认 64）。
     // wake_io_cb：worker→IO 的唤醒通道，每次向 pending_finalize_ 追加后调用一次。
+    // execute_cb：任务执行入口（架构 §8 的 execute/dispatch），由 server 侧实现
+    //             （步骤 7：Server::execute → dispatch → handle_*）。
     //
-    // wake_io 的注入方式（决策）：**注入 std::function 回调，不注入 eventfd**。
-    // 理由：eventfd 属 server 层资源（架构 §6.6 / §15-D5），ThreadPool 注入回调后
-    // 与"如何唤醒 epoll_wait"彻底解耦——server 用 eventfd write(1)，测试可用空回调；
-    // 若注入裸 fd，ThreadPool 就被迫知道"写 1 个 uint64"的协议细节，且 fd 生命周期
-    // 归 server 却散落在两个模块里。回调在本类中只被 worker 调用、只执行一次
-    // write(2)，绝不长时间持锁（调用点见下），不引入 pool 层之外的依赖。
+    // 两个回调的注入方式同源（决策）：**注入 std::function，不把 eventfd / Server
+    // 类型塞进本模块**。理由：eventfd 属 server 层资源（架构 §6.6 / §15-D5），而
+    // 消息处理要用到 send_frame / storage_dir_ / stats_（同样是 server 层的东西）。
+    // ThreadPool 注入回调后与"怎么唤醒 epoll_wait""任务怎么执行"彻底解耦——本模块
+    // 只负责调度（取任务、串行化、收尾移交），测试可用空回调；若注入裸 fd 或让
+    // ThreadPool 认识 Server，调度器就被迫知道协议细节与存储布局。
+    // 两个回调都只被 worker 调用、都在**不持任何锁**时调用（调用点见 .cpp），
+    // 故不会引入锁序问题。
     ThreadPool(std::size_t n_threads, std::size_t queue_cap,
-               std::size_t conn_queue_cap, std::function<void()> wake_io_cb);
+               std::size_t conn_queue_cap, std::function<void()> wake_io_cb,
+               std::function<void(const std::shared_ptr<Connection>&, const MsgTask&)>
+                   execute_cb);
 
     ~ThreadPool();
 
@@ -92,6 +91,10 @@ private:
     // 线程一起跑就能看到完全初始化的调度状态。
     // 析构顺序相反：shutdown() 先 join，再销毁其余成员（顺序安全）。
     std::function<void()> wake_io_cb_;
+    // 前置（由 Server::execute 自己保证）：进入时在 state_mu 下确认 !closed 并置
+    // task_running = true —— 此后 FileSession 被本 worker 独占，IO 线程不会触碰
+    // （架构 §7.1）。task_running 的清零由 worker_loop 收尾三步负责，回调内不管。
+    std::function<void(const std::shared_ptr<Connection>&, const MsgTask&)> execute_cb_;
     const std::size_t queue_cap_;
     const std::size_t conn_queue_cap_;
 

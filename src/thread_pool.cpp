@@ -1,34 +1,24 @@
 // thread_pool.cpp — 调度器实现（架构 §5.3 submit / §5.4 worker_loop / §5.5 不变式与退出）
 // 本文件严格对照架构 §5 的伪代码落地，差异仅有两处注释已标明的实现细节：
 //   1) 收尾三步各用一个作用域块，保证 state_mu 与 mu_ 不同时持有（架构 §4.2 锁序）；
-//   2) 执行入口的 closed 检查与 task_running 置位在同一临界区内完成（架构 §8 execute）。
+//   2) 执行入口的 closed 检查与 task_running 置位不在本文件里，而在注入的
+//      execute_cb_（= Server::execute）内、同一个临界区中完成（架构 §8 execute）。
 
 #include "thread_pool.h"
 
-// --------------------------------------------------------------------------
-// 任务执行入口（步骤 4B 占位，仅用于编译验证）
-// --------------------------------------------------------------------------
-// 占位只做一件事：按架构 §8 在 state_mu 下置 task_running（收尾清除在 worker_loop）。
-// 不 requeue：tasks 受 pool.mu_ 保护，本函数在 state_mu 下，不得再去拿 pool.mu_
-// （架构 §4.2 锁序：state_mu 与 pool.mu_ 不得同时持有），故任务被取出后即丢弃。
-// 后果：§5.5 不变式（queued_total_ == Σ|conn->tasks|）在步骤 7 落地前不成立，
-// 本占位版本禁止实际运行（含测试）；仅作编译验证。
-void execute(const std::shared_ptr<Connection>& c, const MsgTask& t) {
-    std::lock_guard<std::mutex> g(c->state_mu);
-    if (c->closed) return;  // I1：入队后、执行前连接已死 → 不碰 session
-    c->task_running = true;
-    // TODO(step 7): 按架构 §8.2/§8.3/§8.4/§8.5 分发：
-    //   switch (static_cast<MsgType>(t.type)) → handle_meta/chunk/end/heartbeat(c, t.body);
-    (void)t;  // 占位不读任务体
-}
+// 任务执行入口（架构 §8 的 execute/dispatch）自步骤 7 起由 Server 提供，
+// 经构造函数注入到 execute_cb_（见 thread_pool.h 的回调说明）。
 
 // --------------------------------------------------------------------------
 // ThreadPool
 // --------------------------------------------------------------------------
 
 ThreadPool::ThreadPool(std::size_t n_threads, std::size_t queue_cap,
-                       std::size_t conn_queue_cap, std::function<void()> wake_io_cb)
+                       std::size_t conn_queue_cap, std::function<void()> wake_io_cb,
+                       std::function<void(const std::shared_ptr<Connection>&, const MsgTask&)>
+                           execute_cb)
     : wake_io_cb_(std::move(wake_io_cb)),
+      execute_cb_(std::move(execute_cb)),
       queue_cap_(queue_cap),
       conn_queue_cap_(conn_queue_cap) {
     workers_.reserve(n_threads);
@@ -116,7 +106,8 @@ void ThreadPool::worker_loop() {
             cv_space_.notify_all();  // 唤醒可能阻塞的 IO 线程
         }
 
-        execute(c, t);  // 锁外执行；入口先查 closed，再置 task_running（架构 §8）
+        execute_cb_(c, t);  // 锁外执行；入口（Server::execute）先查 closed 再置
+                            // task_running（架构 §8）
 
         // ---- 收尾三步：三个作用域互不嵌套，满足 §4.2 锁序 ----
         bool disc;
@@ -127,9 +118,8 @@ void ThreadPool::worker_loop() {
         }
         {
             std::lock_guard<std::mutex> lk(mu_);
-            // ⚠️ 步骤 7 前（execute() 为占位）：任务已被丢弃，tasks 里不可能有残留，
-            //    下面的"死连接批量清扫"分支在占位期间恒不触发——其正确性要等真实
-            //    dispatch 落地、任务真会积压时才能验证。
+            // 自步骤 7 起 execute_cb_ 是真执行，任务真会积压，下面的"死连接批量清扫"
+            // 分支可达（连接在排队期间死亡 → 取出后批量丢弃并归还额度）。
             if (c->closed) {  // 死连接：批量清扫剩余任务，释放额度（架构 §5.4）
                 queued_total_ -= c->tasks.size();
                 c->tasks.clear();
