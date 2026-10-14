@@ -1,9 +1,10 @@
-// server.h — Server：监听/epoll/eventfd/signalfd 基础设施与事件循环（6A + 6B + 6C1/6C2）
+// server.h — Server：监听/epoll/eventfd/signalfd 基础设施与事件循环（6A + 6B + 6C + 6D）
 // 依据：架构文档 §6.1（epoll 集合与兴趣位）、§6.2（事件循环骨架）、§6.3（accept）、
 //       §6.4（接收与解析）、§6.5（发送路径）、§6.6（唤醒机制）、§7.4（finalize 与
 //       延迟收尾移交）、§7.5（四类关闭路径）、§11.1（启动序列）、§11.2（优雅退出）、
-//       §15-D2（LT）、§15-D4（IO 线程独占 ADD/DEL）、§15-D5（两个内部 fd）、
-//       §15-D11（--threads 回退 4）、§15-D12（body 拷贝一次）、§15-D14（EMFILE 退让）；
+//       §15-D2（LT）、§15-D3（退出宽限 3 秒）、§15-D4（IO 线程独占 ADD/DEL）、
+//       §15-D5（两个内部 fd）、§15-D11（--threads 回退 4）、§15-D12（body 拷贝一次）、
+//       §15-D14（EMFILE 退让）；
 //       PRD §10.1（CLI 默认值）、§10.2（退出码 2）、§11（日志点）、§12（生命周期）。
 //
 // 已落地：
@@ -14,11 +15,13 @@
 //   - 6C1：发送路径 —— send_frame / update_interest / apply_interest_locked。
 //   - 6C2：收尾路径 —— finalize（幂等）/ close_connection（defer 移交）/ on_writable /
 //         drain_eventfd 消费 pending_finalize_。
-// 未落地（TODO 标注）：静态校验与错误帧 send_error（第 8 步）、worker 侧 dispatch
-// （第 7 步）、宽限退出（6D）。
+//   - 6D：优雅退出 —— shutting_down_/grace_deadline_ 两个字段、handle_signal 软停、
+//         run() 的宽限 timeout、on_grace_timeout 强关残余连接 + join 线程池。
+// 未落地（TODO 标注）：静态校验与错误帧 send_error（第 8 步）、worker 侧 dispatch（第 7 步）。
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -62,13 +65,16 @@ public:
     Server(Server&&) = delete;
     Server& operator=(Server&&) = delete;
 
-    // epoll 主循环：阻塞在 epoll_wait(-1)，直到 running_ 被置 false
-    // （signalfd 收到 SIGINT/SIGTERM，或其它线程调用 request_stop()）。
-    // 返回前打印退出统计行（PRD §11）。
+    // epoll 主循环。timeout 恒为 -1，直到进入优雅退出（shutting_down_）后改用
+    // "距 grace_deadline_ 的剩余毫秒"（架构 §11.2 步骤 2），到期由 on_grace_timeout()
+    // 强关残余连接。循环在 running_ 被置 false 时结束（第二次信号 / request_stop() /
+    // 宽限到期），返回前 join 线程池并打印退出统计行（PRD §11 / §12）。
     void run();
 
-    // 置 running_ = false 并写 eventfd 唤醒阻塞中的 epoll_wait（架构 §6.6）。
-    // 供 6D 的信号处理路径与测试调用；幂等，可从任意线程调用。
+    // 【硬停】立即退出主循环，不走优雅退出宽限：置 running_ = false 并写 eventfd
+    // 唤醒阻塞中的 epoll_wait（架构 §6.6）。信号路径走的是软停（handle_signal 对
+    // 第一次信号的处理 → shutting_down_），本函数留给测试 / 强制停止使用。
+    // 幂等，可从任意线程调用。
     void request_stop();
 
     // ---------- 字段 ----------
@@ -91,7 +97,17 @@ public:
     std::mutex conns_mu_;
     std::unordered_map<int, ConnectionPtr> conns_;
 
-    std::atomic<bool> running_{true};  // 主循环开关（signalfd 路径 / request_stop）
+    std::atomic<bool> running_{true};  // 主循环开关（信号路径 / request_stop）
+
+    // 优雅退出状态（架构 §11.2 步骤 1–2 / §15-D3）。与 running_ 是**两件事**：
+    //   running_ = false  → 完全退出主循环；
+    //   shutting_down_    → 只是停止 accept（listen_fd 已摘出 epoll），已建立连接
+    //                       照常收/发/处理，主循环改用宽限 timeout。
+    // 写者唯一 = IO 线程（handle_signal 在事件分发里就地执行，run() 只读），故
+    // grace_deadline_ 无需额外同步；shutting_down_ 用 atomic 是为了让"是否已进入
+    // 宽限"能被任意线程安全观察（on_accept 的漏网事件判定也读它）。
+    std::atomic<bool> shutting_down_{false};
+    std::chrono::steady_clock::time_point grace_deadline_{};  // 宽限截止时刻
 
     // 统计（PRD §11/§12）：accept 计 total_conns；FILE_END 校验结果计 files_ok/fail。
     struct Stats {
@@ -123,7 +139,11 @@ private:
     void finalize(const ConnectionPtr&);
 
     // ---------- 内部 fd 与退出 ----------
-    void handle_signal();    // 6A 已实现：排空 signalfd + running_ = false
+    // 6D 已实现：排空 signalfd。第一次信号 → 软停（置 shutting_down_ + 摘 listen_fd
+    // + 记宽限截止，架构 §11.2 步骤 1–2）；已在宽限中又收到信号 → 硬停（running_ = false）。
+    void handle_signal();
     void drain_eventfd();    // 6C2 已实现：排空 eventfd + 消费 pending_finalize_
-    void on_grace_timeout(); // TODO(6D)：宽限到期强关剩余连接（架构 §11.2）
+    // 6D 已实现：宽限到期 —— 强关残余连接 + pool_.shutdown() + 消费移交队列
+    // （架构 §11.2 步骤 3–4）。仅 IO 线程调用（由 run() 的 timeout 分支就地执行）。
+    void on_grace_timeout();
 };

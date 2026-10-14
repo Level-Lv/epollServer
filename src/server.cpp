@@ -1,14 +1,15 @@
-// server.cpp — Server 实现（6A 基础设施 + 6B 连接事件 + 6C1 发送路径 + 6C2 收尾路径）
+// server.cpp — Server 实现（6A 基础设施 + 6B 连接事件 + 6C1 发送路径 + 6C2 收尾路径
+//              + 6D 优雅退出）
 // 依据：架构文档 §6.1（epoll 集合）、§6.2（事件循环）、§6.3（accept）、§6.4（接收与
 //       解析）、§6.5（发送路径）、§6.6（eventfd/signalfd）、§7.4（finalize 与延迟
 //       收尾移交）、§7.5（四类关闭路径）、§11.1（启动序列）、§11.2（优雅退出）、
-//       §15-D2/D4/D5/D8/D12/D14；PRD §8.4（SIGPIPE）、§10.2（退出码）、§11（日志）、
-//       §12（生命周期）。
+//       §15-D2（LT）、§15-D3（宽限 3 秒）、§15-D4（IO 线程独占 ADD/DEL）、§15-D5、
+//       §15-D8（tmp 权限）、§15-D12（body 拷贝一次）、§15-D14（EMFILE 退让）；
+//       PRD §8.4（SIGPIPE）、§10.2（退出码）、§11（日志）、§12（生命周期）。
 //
-// 6C2 范围：finalize（幂等收尾）/ close_connection（defer 判定 + 移交）/
-// on_writable（冲刷 out_buf）/ drain_eventfd 消费 pending_finalize_；
-// 并删除 6B 的临时收尾 close_connection_brutal，其调用点全部改走 close_connection。
-// 至此"连接生命周期 + fd 安全"（架构 §7）闭环。
+// 6D 范围：handle_signal 软停（第一次信号：shutting_down_ + 摘 listen_fd + 记宽限
+// 截止；第二次信号：硬停）/ run() 宽限 timeout / on_grace_timeout（强关残余连接 +
+// pool_.shutdown() + 消费待收尾移交）/ run() 退出后 join 线程池。
 // 待落地（TODO 标注了负责的子步骤）：
 //   - 静态校验与错误帧 send_error（第 8 步；recv 硬错误目前只置 closing）；
 //   - worker 侧 dispatch（execute 仍是占位：任务被取出后丢弃）→ 第 7 步。
@@ -17,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <netinet/in.h>
@@ -28,6 +30,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 #include "log.h"
 
@@ -40,6 +43,10 @@ constexpr int kMaxEvents = 256;
 // 走"resize 预留 → recv 直写 in_buf 尾部 → 按实际长度收缩"，故不需要 256 KiB
 // 的栈/thread_local 中转缓冲（架构 §6.4 原文即此写法，一次拷贝入 buf）。
 constexpr std::size_t kRecvChunk = 256U * 1024U;
+
+// 退出宽限秒数（架构 §15-D3 / PRD §12）：从收到第一个 SIGINT/SIGTERM 起算，
+// 期间只停止 accept，已建立连接照常处理；到期强关残余连接。
+constexpr unsigned kGraceSeconds = 3;
 
 // 写 eventfd：worker→IO 的唤醒通道（架构 §6.6），wake_io_cb_ 与 request_stop 共用。
 // 失败不打印日志（worker 侧热路径）：计数已达上限时说明 fd 本就可读，不丢唤醒；
@@ -175,13 +182,29 @@ Server::~Server() {
 }
 
 // ---------------------------------------------------------------------------
-// 主循环（架构 §6.2 骨架；宽限超时属 6D，本步 timeout 恒为 -1）
+// 主循环（架构 §6.2 骨架 + §11.2 宽限 timeout）
 // ---------------------------------------------------------------------------
 
 void Server::run() {
     epoll_event evs[kMaxEvents];
     while (running_) {
-        const int n = ::epoll_wait(epfd_, evs, kMaxEvents, -1);
+        // 宽限期内必须用"距 deadline 的剩余毫秒"取代 -1（架构 §11.2 步骤 2）：
+        // 已建立连接若一直安静，epoll_wait(-1) 永远不会返回，宽限就永远无法到期。
+        // 事件分发本身不变 —— 宽限期内照常收/发/处理（"允许完成当前文件"）。
+        int timeout_ms = -1;
+        if (shutting_down_) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= grace_deadline_) {
+                on_grace_timeout();  // 内部置 running_ = false（架构 §11.2 步骤 3–4）
+                break;
+            }
+            timeout_ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(grace_deadline_ - now)
+                    .count());
+            if (timeout_ms <= 0) timeout_ms = 1;  // 亚毫秒剩余：至少 1ms，避免忙转
+        }
+
+        const int n = ::epoll_wait(epfd_, evs, kMaxEvents, timeout_ms);
         if (n < 0) {
             if (errno == EINTR) continue;  // 被信号打断：信号本身由 signalfd 接管
             LOG_ERROR("epoll_wait 失败：%s", std::strerror(errno));
@@ -239,6 +262,17 @@ void Server::run() {
         }
     }
 
+    // 无条件落地"已退出"状态。epoll_wait 硬错误那条 break 是循环内唯一不置 running_
+    // 的退出路径（另外三条：第二次信号 / request_stop / on_grace_timeout 都会置），
+    // 这一行补上它，维持不变式 "run() 返回 ⇒ running_ == false"。纯粹为不变式服务：
+    // 循环已经结束，没有任何逻辑依赖这一行的取值。
+    running_ = false;
+
+    // 退出前的线程池收尾：宽限到期路径已在 on_grace_timeout() 里 shutdown 过（幂等），
+    // 这里兜住 request_stop()（硬停）/ epoll_wait 出错这两条**不走宽限**的路径 ——
+    // 否则 worker 线程会活着撑到 ~Server，期间仍可能触碰连接对象。
+    pool_.shutdown();
+
     // 退出统计行（PRD §11 / §12）
     LOG_INFO("退出：累计连接 %llu，成功文件 %llu，失败文件 %llu",
              static_cast<unsigned long long>(stats_.total_conns.load()),
@@ -247,6 +281,8 @@ void Server::run() {
 }
 
 void Server::request_stop() {
+    // 硬停：立即退出，不走宽限。信号路径（handle_signal 的第一次信号）走软停。
+    // 测试/强制停止用。
     running_ = false;
     write_eventfd(eventfd_);  // 唤醒阻塞在 epoll_wait(-1) 的 IO 线程（架构 §6.6）
 }
@@ -256,6 +292,11 @@ void Server::request_stop() {
 // ---------------------------------------------------------------------------
 
 void Server::on_accept() {
+    // 宽限期内不再 accept（架构 §11.2 步骤 1"不接收新连接"）。摘 listen_fd 只能
+    // 阻止**后续**的 epoll_wait 报它 —— 同一批事件里可能已经躺着一条更早就绪的
+    // EPOLLIN（epoll_wait 早已把事件拷进用户数组），这条漏网事件不能再放进新连接。
+    if (shutting_down_) return;
+
     // 架构 §6.3：LT 下一次事件内排空到 EAGAIN。每 IP 的存储子目录不在 accept 阶段
     // 创建，推迟到该连接第一条 FILE_META（PRD §7.1）。
     for (;;) {
@@ -333,10 +374,15 @@ void Server::drain_eventfd() {
 }
 
 void Server::handle_signal() {
-    // 6A 只做两件事：排空 signalfd（LT，不排空会忙转）+ 结束主循环。
-    // TODO(6D)：改为 shutting_down_ 语义 —— EPOLL_CTL_DEL(listen_fd) 停止 accept、
-    //           epoll_wait 切 3 秒宽限 timeout、到期 on_grace_timeout() 强关残余连接
-    //           （架构 §11.2 / PRD §12）。
+    // 排空 signalfd（LT：不排空会忙转），只留第一个信号号给日志用。
+    //
+    // 关于"第二次 Ctrl+C"：标准信号不排队，同一个信号在 pending 期间不会叠加第二条
+    // 记录（内核直接丢弃）。人手连按能否命中取决于 IO 线程是否被卡住：
+    //   - 空闲时 IO 线程立刻排空，两次 Ctrl+C 几乎总能读到两条；
+    //   - 背压下（IO 线程卡在 pool_.submit()）排空被推迟，两次同号信号可能被内核
+    //     合并成一条，只走满宽限。
+    // 不同号信号不受此限（INT 和 TERM 是两条不同记录），但本函数的语义只把"已在
+    // 宽限中再次收到信号"当强制退出信号。
     unsigned signo = 0;
     for (;;) {
         signalfd_siginfo si{};
@@ -348,10 +394,32 @@ void Server::handle_signal() {
         if (n < 0 && errno == EINTR) continue;
         break;  // EAGAIN：已排空
     }
-    if (signo != 0) {
-        LOG_INFO("收到信号 %u，退出主循环", signo);
+    if (signo == 0) return;  // 竞态下读空：无可处理信号，主循环照常
+
+    if (shutting_down_) {
+        // 第二次信号：不等宽限，直接强制退出（架构 §11.2 的软停 + PRD §12）。
+        // 连接不做收尾：由 ~Server 的连接表清理兜底（~Connection close fd /
+        // ~FileSession unlink tmp）。
+        // 这里的 write_eventfd 本可省（本函数就跑在 IO 线程上，返回后
+        // while (running_) 自然不再成立），保留它是为了与 request_stop 同形：
+        // 无论谁置的 running_，都保证有一个 eventfd 令牌把可能阻塞的 epoll_wait
+        // 叫醒，代价只是一次非阻塞 write。
+        LOG_WARN("收到第二个信号 %u，强制退出", signo);
+        running_ = false;
+        write_eventfd(eventfd_);
+        return;
     }
-    running_ = false;
+
+    // 第一次信号 → 软停（架构 §11.2 步骤 1–2）：
+    //   1) 摘 listen_fd 停止 accept（内核 backlog 里的半连接在进程退出时被 RST，
+    //      架构 §11.2 末段 —— MVP 接受）；
+    //   2) 记宽限截止；run() 此后用剩余毫秒当 epoll_wait 的 timeout。
+    // 已建立连接不在这里动：宽限期内它们照常收/发/处理（PRD §12）。
+    LOG_INFO("收到信号 %u，进入 %u 秒优雅退出宽限", signo, kGraceSeconds);
+    shutting_down_ = true;
+    ::epoll_ctl(epfd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
+    grace_deadline_ = std::chrono::steady_clock::now() +
+                      std::chrono::seconds(kGraceSeconds);
 }
 
 // ---------------------------------------------------------------------------
@@ -635,9 +703,59 @@ void Server::on_writable(const ConnectionPtr& c) {
 }
 
 // ---------------------------------------------------------------------------
-// 占位实现（6D 落地；本步不参与任何实际路径）
+// 6D：宽限到期（架构 §11.2 步骤 3–4）
 // ---------------------------------------------------------------------------
 
 void Server::on_grace_timeout() {
-    // TODO(6D)：宽限到期 → 强关全部残余连接（架构 §11.2 步骤 3）
+    // 仅 IO 线程调用（run() 的 timeout 分支就地调用，见 server.h）。
+    LOG_INFO("宽限到期，开始强制关闭剩余连接");
+
+    // 1) 快照连接表。必须先快照再逐个处理，两个原因：
+    //    ① 后面的 close_connection/finalize 会 erase conns_ —— 持迭代器遍历即失效；
+    //    ② finalize 自己会取 conns_mu_ —— 在持锁状态下调用即自锁（std::mutex 不可重入）。
+    std::vector<ConnectionPtr> all;
+    {
+        std::lock_guard<std::mutex> g(conns_mu_);
+        all.reserve(conns_.size());
+        for (const auto& kv : conns_) all.push_back(kv.second);
+    }
+
+    // 2) 逐个走统一关闭入口（§7.5）：无任务在跑的当即 finalize；有任务在跑的置
+    //    disconnect_requested，由该 worker 收尾时把连接移交到 pending_finalize_（§7.4）。
+    for (const auto& c : all) {
+        close_connection(c);
+    }
+
+    // 3) 停线程池：join 全部 worker。worker 收尾时会把带 disconnect_requested 的连接
+    //    推进 pending_finalize_。**这里可能阻塞**——worker 正在写大文件时要等它做完；
+    //    宽限只是"停止 accept 后给已建立连接的机会"，不保证完成（PRD §12），接受。
+    pool_.shutdown();
+
+    // 4) 消费宽限期内（含上面 join 期间）worker 移交的全部收尾请求。
+    //    take_pending 是 swap 语义：列表副本已从 ThreadPool 摘走，此处的
+    //    finalize（close + unlink）不会挡住任何 worker（它们已全部 join 完）。
+    std::vector<ConnectionPtr> pending;
+    pool_.take_pending(pending);
+    for (const auto& c : pending) {
+        finalize(c);
+    }
+
+    // 5) 保险：conns_ 里理论上已无残留（步骤 2 覆盖了快照里的全部连接，accept 也已
+    //    停止，快照之后不可能再入表）。真出现残留也按同一路径清掉；同样先快照再
+    //    finalize（理由见步骤 1）。此时 worker 已全部 join，finalize 的前置
+    //    "task_running == false"必然成立（I2），故可以直接调 finalize 而不必再过
+    //    close_connection 的 defer 判定。
+    {
+        std::vector<ConnectionPtr> rest;
+        {
+            std::lock_guard<std::mutex> g(conns_mu_);
+            rest.reserve(conns_.size());
+            for (const auto& kv : conns_) rest.push_back(kv.second);
+        }
+        for (const auto& c : rest) {
+            finalize(c);
+        }
+    }
+
+    running_ = false;
 }
